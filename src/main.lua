@@ -1,0 +1,47 @@
+-- Entry module of the Pokemon Core plugin.
+local games = require("core.games")
+local adapters = require("core.adapters")
+local interface = require("core.interface")
+local serialize = require("core.serialize")
+
+local TEAM_EVERY = 15
+
+local entry, detected = games.detect(fb.game)
+if not entry then
+  fb.log.info(fb.i18n.t("not_pokemon"))
+  return
+end
+
+local adapter
+local adapter_mod = adapters.get(entry.adapter)
+if adapter_mod then
+  local ok, result = pcall(adapter_mod.attach, { fb = fb, game = entry, detected = detected })
+  if ok and type(result) == "table" then
+    adapter = result
+  else
+    fb.log.error(fb.i18n.t("adapter_failed", { name = entry.name, error = tostring(result) }))
+  end
+end
+if not adapter then
+  fb.log.warn(fb.i18n.t("no_adapter", { name = entry.name }))
+end
+
+local api = interface.new(entry, detected, adapter)
+fb.provide("pokemon.core", api)
+
+if adapter then
+  fb.events.emit("game.detected", { game_id = entry.id, gen = entry.gen, supported = true })
+
+  local ticks, last = 0, nil
+  fb.on_tick(function()
+    ticks = ticks + 1
+    if ticks % TEAM_EVERY ~= 0 then return end
+    local team = api.team()
+    if type(team) ~= "table" then return end
+    local s = serialize.serialize(team)
+    if s ~= last then
+      last = s
+      fb.events.emit("team.changed", { team = team })
+    end
+  end)
+end

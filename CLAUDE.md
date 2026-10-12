@@ -32,7 +32,10 @@ framebeam-plugin-pokemon-core is the shared Pokémon foundation plugin. It detec
 
 ## Status and commands
 
-- Status: no code yet. Commands (test, lint, package) will be added here when they exist; list only commands that have been run.
+- Status: skeleton with game detection (Gen 3-7), the `pokemon.core` interface and the first adapter (Omega Ruby/Alpha Sapphire: team, boxes). Layout: `docs/architecture.md`.
+- Sources are modules in `src/`; the sandbox has no `require`, so `lua5.4 tools/bundle.lua` generates the single `plugin/main.lua` (committed; list new modules in `src/modules.txt`). `lua5.4 tools/bundle.lua --check` fails when it is stale.
+- Tests: `lua5.4 tests/run.lua` (fake `fb` in `tests/support/fb_mock.lua`, synthetic PK6 via `tests/support/pk6_*.lua`). CI runs both checks (`.github/workflows/ci.yml`).
+- The folder `plugin/` is what gets installed or linked in the FrameBeam developer mode.
 - The SessionStart hook `.claude/hooks/session-start.sh` only prepares cloud sessions (installs `lua5.4` via apt if missing).
 
 ## Pointers

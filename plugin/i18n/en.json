@@ -1,0 +1,5 @@
+{
+  "not_pokemon": "Not a supported Pokémon game; Pokémon Core stays idle.",
+  "no_adapter": "No memory adapter for {name} yet; only game detection is available.",
+  "adapter_failed": "Adapter for {name} failed to start: {error}"
+}
