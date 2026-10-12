@@ -1,0 +1,29 @@
+{
+  "id": "net.framebeam.pokemon-core",
+  "name": "Pokémon Core",
+  "version": "0.1.0",
+  "api": 1,
+  "type": "script",
+  "provides": ["pokemon.core"],
+  "games": [
+    {
+      "system": "3ds",
+      "codes": [
+        "0004000000055D00",
+        "0004000000055E00",
+        "000400000011C400",
+        "000400000011C500",
+        "0004000000164800",
+        "0004000000175E00",
+        "00040000001B5000",
+        "00040000001B5100"
+      ]
+    },
+    {
+      "system": "nds",
+      "codes": ["ADA?", "APA?", "CPU?", "IPK?", "IPG?", "IRB?", "IRA?", "IRE?", "IRD?"]
+    }
+  ],
+  "permissions": ["memory.read", "rom.read"],
+  "entry": "main.lua"
+}

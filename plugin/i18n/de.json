@@ -1,0 +1,5 @@
+{
+  "not_pokemon": "Kein unterstütztes Pokémon-Spiel; Pokémon Core bleibt inaktiv.",
+  "no_adapter": "Für {name} gibt es noch keinen Speicher-Adapter; nur die Spielerkennung ist verfügbar.",
+  "adapter_failed": "Der Adapter für {name} konnte nicht gestartet werden: {error}"
+}

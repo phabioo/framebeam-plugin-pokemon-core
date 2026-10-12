@@ -1,0 +1,9 @@
+core.adapters
+core.games
+core.interface
+core.serialize
+gen6.growth
+gen6.oras
+gen6.personal
+gen6.pk6
+main
