@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to release (vX.Y.Z)"
+        description: "Tag to release (vX.Y.Z). Created at the dispatch commit (main) when it does not exist yet."
         required: true
 permissions:
   contents: write
@@ -17,9 +17,30 @@ jobs:
       TAG: ${{ inputs.tag || github.ref_name }}
       GH_TOKEN: ${{ github.token }}
     steps:
+      - name: Validate tag and check whether it exists
+        id: tag
+        env:
+          REF: ${{ github.ref }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag must match vX.Y.Z"
+            exit 1
+          fi
+          match=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" \
+            --jq "[.[] | select(.ref == \"refs/tags/$TAG\")] | length")
+          if [ "$match" -gt 0 ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            if [ "$EVENT" != "workflow_dispatch" ] || [ "$REF" != "refs/heads/main" ]; then
+              echo "::error::A new tag is only created from a manual run on main"
+              exit 1
+            fi
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.TAG }}
+          ref: ${{ steps.tag.outputs.exists == 'true' && format('refs/tags/{0}', env.TAG) || github.sha }}
       - run: sudo apt-get update && sudo apt-get install -y lua5.4
       - run: lua5.4 tools/bundle.lua --check
       - run: lua5.4 tests/run.lua
@@ -28,10 +49,15 @@ jobs:
       - name: Verify package
         run: python3 -I tools/package.py --verify dist/*.fbplugin
       - name: Create or update release
+        env:
+          TAG_EXISTS: ${{ steps.tag.outputs.exists }}
         run: |
           asset=$(ls dist/*.fbplugin)
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "$asset" --clobber
-          else
+          elif [ "$TAG_EXISTS" = "true" ]; then
             gh release create "$TAG" "$asset" --title "$TAG" --verify-tag --generate-notes
+          else
+            # Creates the tag at the checked-out commit.
+            gh release create "$TAG" "$asset" --title "$TAG" --target "$GITHUB_SHA" --generate-notes
           fi
