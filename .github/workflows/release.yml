@@ -1,0 +1,37 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release (vX.Y.Z)"
+        required: true
+permissions:
+  contents: write
+jobs:
+  release:
+    name: package and release
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - run: sudo apt-get update && sudo apt-get install -y lua5.4
+      - run: lua5.4 tools/bundle.lua --check
+      - run: lua5.4 tests/run.lua
+      - name: Package (fails when tag and manifest version differ)
+        run: python3 -I tools/package.py --out dist --tag "$TAG"
+      - name: Verify package
+        run: python3 -I tools/package.py --verify dist/*.fbplugin
+      - name: Create or update release
+        run: |
+          asset=$(ls dist/*.fbplugin)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$asset" --clobber
+          else
+            gh release create "$TAG" "$asset" --title "$TAG" --verify-tag --generate-notes
+          fi
