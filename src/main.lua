@@ -35,6 +35,7 @@ if adapter then
   local ticks, last = 0, nil
   fb.on_tick(function()
     ticks = ticks + 1
+    if type(adapter.tick) == "function" then adapter:tick() end
     if ticks % TEAM_EVERY ~= 0 then return end
     local team = api.team()
     if type(team) ~= "table" then return end

@@ -137,10 +137,11 @@ __mod["core.interface"] = function(...)
 -- Builds the table for fb.provide("pokemon.core", tbl).
 local M = {}
 
-local METHODS = { "team", "box", "box_count", "location", "battle", "encounters", "badges" }
+local METHODS = { "team", "box", "box_count", "location", "battle", "encounters", "badges", "icon",
+  "map_candidates", "map_image", "map_selected" }
 local FEATURE = {
   team = "team", box = "box", location = "location",
-  battle = "battle", encounters = "encounters", badges = "badges",
+  battle = "battle", encounters = "encounters", badges = "badges", icon = "icons", map_candidates = "map",
 }
 
 local function has(adapter, name)
@@ -154,6 +155,13 @@ function M.new(entry, detected, adapter)
   function api.info()
     local features = {}
     for method, key in pairs(FEATURE) do features[key] = has(adapter, method) end
+    -- An adapter may refine features that depend on runtime state (icons found, address set).
+    if has(adapter, "features") then
+      local over = adapter:features()
+      if type(over) == "table" then
+        for k, v in pairs(over) do features[k] = v == true end
+      end
+    end
     local language = detected and detected.language or nil
     if has(adapter, "language") then language = adapter:language() or language end
     local revision
@@ -222,6 +230,61 @@ end
 return M
 
 end
+__mod["gen6.darc"] = function(...)
+-- Parser for DARC archives (3DS UI archives), read-only, bounds-checked.
+-- Format (3dbrew "DARC"): header "darc", u16 BOM, u16 header size (0x1C), u32 version,
+-- u32 file size, u32 file table offset, u32 file table length, u32 data offset.
+-- File table: 12-byte entries {u32 flags<<24 | name offset, u32 a, u32 b}; flag 1 =
+-- directory (a = parent index, b = index after its last descendant), else file
+-- (a = data offset from file start, b = length). Entry 0 is the root and its b is
+-- the entry count. Names (UTF-16LE, zero terminated) start behind the entry table.
+local M = {}
+
+M.MAX_ENTRIES = 4096
+
+local function name_at(s, base, off)
+  local pos, chars = base + off + 1, {}
+  while #chars < 128 do
+    if pos + 1 > #s then return nil end
+    local c = string.unpack("<I2", s, pos)
+    if c == 0 then break end
+    chars[#chars + 1] = c < 128 and string.char(c) or "?"
+    pos = pos + 2
+  end
+  return table.concat(chars)
+end
+
+-- Returns an array of { path, offset, length } (offset 0-based) or nil, message.
+function M.parse(s)
+  if type(s) ~= "string" or #s < 0x1C or s:sub(1, 4) ~= "darc" then return nil, "not a darc" end
+  local tbl_off, tbl_len = string.unpack("<I4I4", s, 0x11)
+  if tbl_off < 0x1C or tbl_off + 12 > #s or tbl_off + tbl_len > #s then return nil, "bad table" end
+  local count = string.unpack("<I4", s, tbl_off + 8 + 1)
+  if count < 1 or count > M.MAX_ENTRIES or tbl_off + count * 12 > #s then return nil, "bad count" end
+  local names = tbl_off + count * 12
+  local out, stack = {}, {}
+  for i = 1, count - 1 do
+    local nf, a, b = string.unpack("<I4I4I4", s, tbl_off + i * 12 + 1)
+    while #stack > 0 and i >= stack[#stack].last do stack[#stack] = nil end
+    local name = name_at(s, names, nf & 0xFFFFFF)
+    if not name then return nil, "bad name" end
+    if (nf >> 24) == 1 then
+      if b <= i or b > count or #stack >= 16 then return nil, "bad directory" end
+      stack[#stack + 1] = { name = name, last = b }
+    else
+      if a + b > #s then return nil, "bad file" end
+      local parts = {}
+      for _, d in ipairs(stack) do parts[#parts + 1] = d.name end
+      parts[#parts + 1] = name
+      out[#out + 1] = { path = table.concat(parts, "/"), offset = a, length = b }
+    end
+  end
+  return out
+end
+
+return M
+
+end
 __mod["gen6.growth"] = function(...)
 -- EXP <-> level for the six standard growth curves (formulas only, no tables).
 -- Rate IDs follow the games' personal data (PKHeX: Experience.GetEXPTable /
@@ -274,13 +337,485 @@ end
 return M
 
 end
+__mod["gen6.icons"] = function(...)
+-- Box icons of Gen 6 games, read at runtime from the player's own RomFS and
+-- converted to PNG with fb.codec.bclim + fb.codec.png. Nothing is shipped; the
+-- PNGs are derived data in the plugin cache (fb.cache), never in the repository.
+--
+-- The icon GARC is not hardcoded: it is discovered by walking the RomFS and
+-- validated by content (see docs/games/omega-ruby-alpha-sapphire.md, "Icons").
+-- Discovery runs one small step per call (one directory listing or one
+-- candidate validation) so no entry call comes near the 500 ms / 20M budget.
+local M = {}
+
+M.CANDIDATE_PATHS = {}      -- known paths are not sourced; discovery finds the file
+M.ROOT = "/a"
+M.MIN_FILE_SIZE = 256 * 1024       -- assumption: >= ~700 icons of >= 0.4 KiB
+M.MAX_FILE_SIZE = 16 * 1024 * 1024
+M.MIN_ENTRIES, M.MAX_ENTRIES = 700, 1100
+M.SAMPLES = { 1, 25, 150, 300, 500, 700 } -- species whose entries are decoded to validate
+M.SIZES = { ["40x30"] = true, ["32x32"] = true, ["64x32"] = true } -- accepted BCLIM sizes
+M.MAX_STEPS = 4000
+M.INDEX_FILE = "icons/index.txt"      -- first line: RomFS path of the icon GARC
+M.OVERRIDE_FILE = "config/icon_garc.txt" -- optional: RomFS path to try first
+M.MAX_SPECIES = 721
+
+local function first_line(s)
+  if type(s) ~= "string" then return nil end
+  local l = s:match("^%s*([^\r\n]-)%s*[\r\n]") or s:match("^%s*(.-)%s*$")
+  if l and l:match("^/[%w%._%-/]+$") then return l end
+  return nil
+end
+
+function M.new(fb, personal)
+  local self = {}
+  local codec = fb.codec
+  local can = fb.rom and fb.rom.romfs and fb.rom.romfs_list and codec and codec.garc
+    and codec.garc_file and codec.bclim and codec.png and fb.cache and true or false
+
+  local state = can and "idle" or "unsupported" -- idle | scan | done | failed | unsupported
+  local data, path
+  local forced, dirs, cands, steps = {}, {}, {}, 0
+
+  local function read_cache(name)
+    local ok, v = pcall(fb.cache.read, name)
+    if ok and type(v) == "string" then return v end
+    return nil
+  end
+
+  -- Accepts the GARC when sampled entries decode to BCLIM images of an accepted size.
+  local function validate(d)
+    local g = codec.garc(d)
+    if type(g) ~= "table" or type(g.count) ~= "number" then return false end
+    if g.count < M.MIN_ENTRIES or g.count > M.MAX_ENTRIES then return false end
+    for _, s in ipairs(M.SAMPLES) do
+      local e = codec.garc_file(d, s + 1, 1)
+      if type(e) ~= "string" then return false end
+      local img = codec.bclim(e)
+      if type(img) ~= "table" or not M.SIZES[tostring(img.width) .. "x" .. tostring(img.height)] then
+        return false
+      end
+    end
+    return true
+  end
+
+  local function try_path(p)
+    local d = fb.rom.romfs(p)
+    if type(d) ~= "string" or not validate(d) then return false end
+    data, path, state = d, p, "done"
+    pcall(fb.cache.write, M.INDEX_FILE, p .. "\n")
+    if fb.log and fb.log.info then fb.log.info("icon archive accepted at " .. p) end
+    return true
+  end
+
+  local function start()
+    state = "scan"
+    local seen = {}
+    local function add(p)
+      if p and not seen[p] then seen[p] = true; forced[#forced + 1] = p end
+    end
+    add(first_line(read_cache(M.OVERRIDE_FILE)))
+    add(first_line(read_cache(M.INDEX_FILE)))
+    for _, p in ipairs(M.CANDIDATE_PATHS) do add(p) end
+    dirs = { M.ROOT }
+  end
+
+  local function scan_dir(dir)
+    local list = fb.rom.romfs_list(dir)
+    if type(list) ~= "table" then return end
+    for _, e in ipairs(list) do
+      local full = dir .. "/" .. tostring(e.name)
+      if e.dir then
+        dirs[#dirs + 1] = full
+      elseif type(e.size) == "number" and e.size >= M.MIN_FILE_SIZE and e.size <= M.MAX_FILE_SIZE then
+        cands[#cands + 1] = full
+      end
+    end
+  end
+
+  local function advance()
+    if state == "idle" then start() end
+    if state ~= "scan" then return end
+    steps = steps + 1
+    if steps > M.MAX_STEPS then state = "failed"; return end
+    if #forced > 0 then
+      try_path(table.remove(forced, 1))
+    elseif #cands > 0 then
+      try_path(table.remove(cands, 1))
+    elseif #dirs > 0 then
+      scan_dir(table.remove(dirs, 1))
+    else
+      state = "failed"
+      if fb.log and fb.log.warn then fb.log.warn("no box icon archive found in the RomFS") end
+    end
+  end
+
+  -- One bounded discovery step. Never raises.
+  function self.step()
+    local ok, err = pcall(advance)
+    if not ok then
+      state = "failed"
+      if fb.log and fb.log.error then fb.log.error("icon discovery failed: " .. tostring(err)) end
+    end
+  end
+
+  function self.found() return state == "done" end
+  function self.state() return state end
+  function self.path() return path end
+
+  -- Restart discovery (e.g. after a game change).
+  function self.reset()
+    if can then state = "idle" end
+    data, path, forced, dirs, cands, steps = nil, nil, {}, {}, {}, 0
+  end
+
+  local function entry_for(species, form)
+    local idx = personal and personal.form_index(species, form)
+    if idx then return idx, true end
+    -- no such form or personal table unreadable: base icon, not cached under the form key
+    return species, false
+  end
+
+  -- PNG string, or nil, "not_ready" | "unsupported" | "unknown_species".
+  function self.icon(species, form)
+    if math.type(species) ~= "integer" or species < 1 or species > M.MAX_SPECIES then
+      return nil, "unknown_species"
+    end
+    if form == nil then form = 0 end
+    if math.type(form) ~= "integer" or form < 0 then return nil, "unknown_species" end
+    local key = string.format("icons/%d-%d.png", species, form)
+    if state == "unsupported" then return nil, "unsupported" end
+    local hit = read_cache(key)
+    if hit then return hit end
+    if state ~= "done" then
+      self.step()
+      if state == "failed" then return nil, "unsupported" end
+      if state ~= "done" then return nil, "not_ready" end
+    end
+    local idx, exact = entry_for(species, form)
+    local blob = codec.garc_file(data, idx + 1, 1)
+    if type(blob) ~= "string" then return nil, "unknown_species" end
+    local img = codec.bclim(blob)
+    if type(img) ~= "table" then return nil, "unknown_species" end
+    local png = codec.png(img)
+    if type(png) ~= "string" then return nil, "unknown_species" end
+    if exact then pcall(fb.cache.write, key, png) end
+    return png
+  end
+
+  return self
+end
+
+return M
+
+end
+__mod["gen6.maps"] = function(...)
+-- Region map discovery: finds large BCLIM images in the player's own RomFS at
+-- runtime (plain files, GARC entries, LZ10/LZ11-wrapped entries, DARC archives)
+-- and converts a chosen one to PNG. No image is shipped; the index and PNGs are
+-- derived data in the plugin cache (fb.cache). Scanning is a resumable state
+-- machine: one step = one directory listing, one file read, or a bounded batch
+-- of entries, so no entry call nears the 500 ms / 20M instruction budget.
+local darc = require("gen6.darc")
+
+local M = {}
+
+M.ROOT = "/a"
+M.MAX_FILE_SIZE = 32 * 1024 * 1024  -- larger files are skipped
+M.MIN_FILE_SIZE = 64
+M.MIN_W, M.MIN_H = 256, 128         -- candidate threshold (decoded size = BCLIM header size)
+M.ENTRIES_PER_STEP = 16
+M.MAX_ENTRIES_PER_FILE = 5000
+M.MAX_LZ_INPUT = 2 * 1024 * 1024
+M.MAX_LZ_OUTPUT = 4 * 1024 * 1024
+M.MAX_CANDIDATES = 2000             -- kept in the index
+M.LIST_CAP = 40                     -- returned by map_candidates
+M.MAX_PNG = 1024 * 1024             -- interface value limit
+M.SAVE_EVERY = 10                   -- files between progress writes
+M.INDEX = "map/index.txt"           -- "complete" or "partial", then id TAB w TAB h lines
+M.FILES = "map/files.txt"           -- sorted list of scanned file paths
+M.PROGRESS = "map/progress.txt"     -- number of files fully scanned
+
+-- Map id per game id, optionally per revision: MAP_ID[game_id] = "<id>" or { rev2 = "<id>" }.
+-- Fill after the maintainer confirms the region map image.
+M.MAP_ID = {}
+
+-- Width, height of a BCLIM from its 40-byte footer ("CLIM" header + "imag" block), or nil.
+function M.bclim_size(s)
+  if #s < 40 then return nil end
+  local f = #s - 39 -- 1-based start of the footer
+  if s:sub(f, f + 3) ~= "CLIM" or s:sub(f + 20, f + 23) ~= "imag" then return nil end
+  local w, h = string.unpack("<I2I2", s, f + 28)
+  return w, h
+end
+
+local function hash(id)
+  local h = 5381
+  for i = 1, #id do h = (h * 33 + id:byte(i)) & 0xFFFFFFFF end
+  return string.format("%08x", h)
+end
+
+-- "<path>#<entry>[/<darc path>]" -> path, entry, sub
+function M.parse_id(id)
+  if type(id) ~= "string" then return nil end
+  local path, entry, sub = id:match("^(/[^#]+)#(%d+)/(.+)$")
+  if not path then path, entry = id:match("^(/[^#]+)#(%d+)$") end
+  if not path then return nil end
+  return path, tonumber(entry), sub
+end
+
+function M.new(fb, game_id, revision_fn)
+  local self = {}
+  local codec = fb.codec
+  local can = fb.rom and fb.rom.romfs and fb.rom.romfs_list and codec and codec.png and codec.bclim
+    and fb.cache and true or false
+  local state = can and "idle" or "unsupported" -- idle | dirs | files | done | unsupported
+  local dirs, files, fidx, cands, cur = {}, {}, 0, {}, nil
+
+  local function cread(name)
+    local ok, v = pcall(fb.cache.read, name)
+    if ok and type(v) == "string" then return v end
+  end
+  local function cwrite(name, data) pcall(fb.cache.write, name, data) end
+
+  local function save_index(complete)
+    local lines = { complete and "complete" or "partial" }
+    for _, c in ipairs(cands) do lines[#lines + 1] = c.id .. "\t" .. c.w .. "\t" .. c.h end
+    cwrite(M.INDEX, table.concat(lines, "\n") .. "\n")
+  end
+
+  local function load_state()
+    local idx = cread(M.INDEX)
+    if idx then
+      local first = true
+      for line in idx:gmatch("[^\n]+") do
+        if first then
+          first = false
+          if line == "complete" then state = "done" end
+        else
+          local id, w, h = line:match("^(.-)\t(%d+)\t(%d+)$")
+          if id then cands[#cands + 1] = { id = id, w = tonumber(w), h = tonumber(h) } end
+        end
+      end
+      if state == "done" then return end
+    end
+    local list = cread(M.FILES)
+    if list then
+      for line in list:gmatch("[^\n]+") do files[#files + 1] = line end
+      fidx = math.min(tonumber(cread(M.PROGRESS) or "0") or 0, #files)
+      if #files > 0 then state = "files"; return end
+      files = {}
+    end
+    cands = {}
+    dirs = { M.ROOT }
+    state = "dirs"
+  end
+
+  local function add(id, w, h)
+    if w >= M.MIN_W and h >= M.MIN_H and #cands < M.MAX_CANDIDATES then
+      cands[#cands + 1] = { id = id, w = w, h = h }
+    end
+  end
+
+  -- Looks into plain data (no further LZ): BCLIM or DARC with BCLIM files.
+  local function examine_plain(s, id)
+    -- DARC first: its last member may end in a BCLIM footer that would pass for the archive's own
+    if s:sub(1, 4) ~= "darc" then
+      local w, h = M.bclim_size(s)
+      if w then add(id, w, h) end
+    else
+      local list = darc.parse(s)
+      if list then
+        for _, f in ipairs(list) do
+          if f.length >= 40 then
+            local fw, fh = M.bclim_size(s:sub(f.offset + 1, f.offset + f.length))
+            if fw then add(id .. "/" .. f.path, fw, fh) end
+          end
+        end
+      end
+    end
+  end
+
+  local function examine(e, id)
+    local b = e:byte(1)
+    if (b == 0x10 or b == 0x11) and #e <= M.MAX_LZ_INPUT and codec.lz_decompress and #e > 4 then
+      local ok, out = pcall(codec.lz_decompress, e)
+      if ok and type(out) == "string" and #out <= M.MAX_LZ_OUTPUT then examine_plain(out, id) end
+      return
+    end
+    examine_plain(e, id)
+  end
+
+  local function open_file(path)
+    local d = fb.rom.romfs(path)
+    if type(d) ~= "string" then return nil end
+    local okg, g = false, nil
+    if codec.garc and codec.garc_file then okg, g = pcall(codec.garc, d) end
+    if okg and type(g) == "table" and type(g.count) == "number" and g.count >= 1 then
+      return { path = path, data = d, garc = true, count = math.min(g.count, M.MAX_ENTRIES_PER_FILE), next = 1 }
+    end
+    return { path = path, data = d, garc = false, count = 1, next = 1 }
+  end
+
+  local function process(c)
+    local last = math.min(c.next + M.ENTRIES_PER_STEP - 1, c.count)
+    for i = c.next, last do
+      local e = c.data
+      if c.garc then e = codec.garc_file(c.data, i, 1) end
+      if type(e) == "string" and #e >= 40 then examine(e, c.path .. "#" .. i) end
+    end
+    c.next = last + 1
+    return c.next > c.count
+  end
+
+  local function scan_dir(dir)
+    local list = fb.rom.romfs_list(dir)
+    if type(list) ~= "table" then return end
+    for _, e in ipairs(list) do
+      local full = dir .. "/" .. tostring(e.name)
+      if e.dir then
+        dirs[#dirs + 1] = full
+      elseif type(e.size) == "number" and e.size >= M.MIN_FILE_SIZE and e.size <= M.MAX_FILE_SIZE then
+        files[#files + 1] = full
+      end
+    end
+  end
+
+  local function finish()
+    table.sort(cands, function(a, b)
+      local aa, ba = a.w * a.h, b.w * b.h
+      if aa ~= ba then return aa > ba end
+      return a.id < b.id
+    end)
+    state = "done"
+    cur = nil
+    save_index(true)
+    if fb.log and fb.log.info then fb.log.info("map scan finished, " .. #cands .. " candidates") end
+  end
+
+  local function advance()
+    if state == "idle" then load_state() end
+    if state == "idle" then return end
+    if state == "dirs" then
+      if #dirs > 0 then
+        scan_dir(table.remove(dirs, 1))
+      else
+        table.sort(files)
+        cwrite(M.FILES, table.concat(files, "\n") .. "\n")
+        cwrite(M.PROGRESS, "0")
+        fidx, state = 0, "files"
+      end
+    elseif state == "files" then
+      if cur then
+        if process(cur) then
+          cur = nil
+          fidx = fidx + 1
+          if fidx % M.SAVE_EVERY == 0 then cwrite(M.PROGRESS, tostring(fidx)); save_index(false) end
+        end
+      elseif fidx >= #files then
+        finish()
+      else
+        local c = open_file(files[fidx + 1])
+        if c then cur = c else fidx = fidx + 1 end
+      end
+    end
+  end
+
+  -- Restore the saved index/progress at once (cheap cache reads only).
+  if state == "idle" then pcall(load_state) end
+
+  -- One bounded scan step. Never raises.
+  function self.step()
+    if state == "done" or state == "unsupported" then return end
+    local ok, err = pcall(advance)
+    if not ok then
+      state = "unsupported"
+      if fb.log and fb.log.error then fb.log.error("map scan failed: " .. tostring(err)) end
+    end
+  end
+
+  function self.state() return state end
+  function self.found() return state == "done" and #cands > 0 end
+
+  function self.candidates()
+    if state == "unsupported" then return nil, "unsupported" end
+    if state ~= "done" then self.step(); return nil, "not_ready" end
+    local out = {}
+    for i = 1, math.min(#cands, M.LIST_CAP) do
+      local c = cands[i]
+      out[i] = { id = c.id, w = c.w, h = c.h }
+    end
+    return out
+  end
+
+  function self.image(id)
+    if state == "unsupported" then return nil, "unsupported" end
+    local path, entry, sub = M.parse_id(id)
+    if not path then return nil, "unknown_map" end
+    local key = "map/" .. hash(id) .. ".png"
+    local hit = cread(key)
+    if hit then
+      if #hit > M.MAX_PNG then return nil, "too_large" end
+      return hit
+    end
+    if state ~= "done" then self.step(); return nil, "not_ready" end
+    local known = false
+    for _, c in ipairs(cands) do if c.id == id then known = true; break end end
+    if not known then return nil, "unknown_map" end
+    local d = fb.rom.romfs(path)
+    if type(d) ~= "string" then return nil, "unknown_map" end
+    local e = d
+    local okg, g = false, nil
+    if codec.garc then okg, g = pcall(codec.garc, d) end
+    if okg and type(g) == "table" and type(g.count) == "number" and g.count >= 1 then
+      e = codec.garc_file(d, entry, 1)
+    end
+    if type(e) ~= "string" then return nil, "unknown_map" end
+    local b = e:byte(1)
+    if (b == 0x10 or b == 0x11) and codec.lz_decompress and not M.bclim_size(e) then
+      e = codec.lz_decompress(e)
+      if type(e) ~= "string" then return nil, "unknown_map" end
+    end
+    if sub then
+      local list = darc.parse(e)
+      local found
+      for _, f in ipairs(list or {}) do if f.path == sub then found = f; break end end
+      if not found then return nil, "unknown_map" end
+      e = e:sub(found.offset + 1, found.offset + found.length)
+    end
+    local img = codec.bclim(e)
+    if type(img) ~= "table" then return nil, "unknown_map" end
+    local png = codec.png(img)
+    if type(png) ~= "string" then return nil, "unknown_map" end
+    if #png > M.MAX_PNG then return nil, "too_large" end
+    cwrite(key, png)
+    return png
+  end
+
+  function self.selected()
+    local v = M.MAP_ID[game_id]
+    if type(v) == "table" then v = v[revision_fn and revision_fn() or ""] end
+    if type(v) == "string" then return v end
+    return nil
+  end
+
+  return self
+end
+
+return M
+
+end
 __mod["gen6.oras"] = function(...)
 -- Adapter for Pokemon Omega Ruby / Alpha Sapphire (3DS, Gen 6).
 -- Addresses: docs/games/omega-ruby-alpha-sapphire.md. Only team, boxes and
--- revision are backed; location/battle/encounters/badges are not implemented.
+-- revision are backed, plus icon() (gen6.icons) and location() (gen6.oras_location,
+-- active only once a zone address is configured); battle/encounters/badges are not implemented.
 local pk6 = require("gen6.pk6")
 local growth = require("gen6.growth")
 local personal = require("gen6.personal")
+local icons = require("gen6.icons")
+local maps = require("gen6.maps")
+local oras_location = require("gen6.oras_location")
 
 local M = {}
 
@@ -290,6 +825,10 @@ M.PARTY_SIZE = pk6.SIZE_PARTY
 M.BOX_COUNT = 31
 M.BOX_SLOTS = 30
 M.BOX_SIZE = pk6.SIZE_STORED
+M.ICON_START_TICK = 90 -- ticks before icon discovery starts
+M.ICON_STEP_EVERY = 8  -- ticks between discovery steps
+M.MAP_START_TICK = 120 -- map scan starts later; steps are offset from icon steps
+M.MAP_STEP_EVERY = 8 -- steps fall on the odd half of the icon cadence
 M.ORIGIN_AS, M.ORIGIN_OR = 26, 27 -- PKHeX GameVersion (X 24, Y 25)
 
 -- Candidate address sets, checked in this order.
@@ -315,6 +854,10 @@ end
 function M.attach(ctx)
   local fb = ctx.fb
   local pers = personal.new(fb)
+  local icon_store = icons.new(fb, pers)
+  local zone = oras_location.new(fb)
+  local ticks = 0
+  local map_store
   local chosen
 
   for _, set in ipairs(M.REVISIONS) do
@@ -337,6 +880,7 @@ function M.attach(ctx)
   end
 
   local obj = {}
+  map_store = maps.new(fb, ctx.game and ctx.game.id, function() return chosen and chosen.name end)
 
   function obj:revision()
     local set = detect()
@@ -366,6 +910,34 @@ function M.attach(ctx)
       if not best or groups[key].n > best.n then best = groups[key] end
     end
     return best and best.first.language or nil
+  end
+
+  -- Called every tick by main.lua: spreads icon discovery over many ticks.
+  function obj:tick()
+    ticks = ticks + 1
+    if ticks >= M.MAP_START_TICK and ticks % M.MAP_STEP_EVERY == M.MAP_STEP_EVERY // 2 and map_store.state() ~= "done" then
+      map_store.step()
+    end
+    if ticks >= M.ICON_START_TICK and ticks % M.ICON_STEP_EVERY == 0 and icon_store.state() ~= "done" then
+      icon_store.step()
+    end
+  end
+
+  -- Feature overrides: icons only once the GARC is found, location only with an address.
+  function obj:features()
+    return { icons = icon_store.found(), location = zone.configured(), map = map_store.found() }
+  end
+
+  function obj:icon(species, form)
+    return icon_store.icon(species, form)
+  end
+
+  function obj:map_candidates() return map_store.candidates() end
+  function obj:map_image(id) return map_store.image(id) end
+  function obj:map_selected() return map_store.selected() end
+
+  function obj:location()
+    return zone.zone(chosen and chosen.name or nil)
   end
 
   function obj:team()
@@ -404,6 +976,67 @@ end
 return M
 
 end
+__mod["gen6.oras_location"] = function(...)
+-- Current zone id of Omega Ruby / Alpha Sapphire, read from emulator memory.
+-- The RAM address is not known yet: ZONE_ADDR is empty until a local probe finds
+-- it. Meanwhile an address (hex) can be set without a release in the plugin
+-- cache file config/zone_addr.txt (read once at attach; reload the plugin).
+local M = {}
+
+-- Fill from local probe, keyed by revision name of gen6.oras (rev2, rev0_1).
+-- Value: virtual address of the u16 zone id.
+M.ZONE_ADDR = {}
+M.OVERRIDE_FILE = "config/zone_addr.txt"
+
+-- "0x08C12345" or "08C12345" -> integer; nil when not a nonzero 32 bit hex number.
+function M.parse_addr(s)
+  if type(s) ~= "string" then return nil end
+  local h = s:match("^%s*0[xX](%x+)%s*$") or s:match("^%s*(%x+)%s*$")
+  if not h or #h > 8 then return nil end
+  local n = tonumber(h, 16)
+  if not n or n == 0 then return nil end
+  return n
+end
+
+function M.new(fb)
+  local self = {}
+  local override
+  if fb.cache and fb.cache.read then
+    local ok, v = pcall(fb.cache.read, M.OVERRIDE_FILE)
+    if ok then override = M.parse_addr(v) end
+  end
+
+  if override then fb.memory.watch("oras.zone", override, 2) end
+  for rev, addr in pairs(M.ZONE_ADDR) do fb.memory.watch("oras." .. rev .. ".zone", addr, 2) end
+
+  -- Address for a revision (nil = revision unknown); the override wins.
+  function self.address(rev)
+    if override then return override end
+    if rev then return M.ZONE_ADDR[rev] end
+    return nil
+  end
+
+  -- True when some address could apply (override, or any table entry).
+  function self.configured()
+    return override ~= nil or next(M.ZONE_ADDR) ~= nil
+  end
+
+  -- { zone = u16, source = "memory" } or nil, "unsupported" | "not_ready"
+  function self.zone(rev)
+    if not self.configured() then return nil, "unsupported" end
+    local addr = self.address(rev)
+    if not addr then return nil, "not_ready" end
+    local z = fb.memory.u16(addr)
+    if z == nil then return nil, "not_ready" end
+    return { zone = z, source = "memory" }
+  end
+
+  return self
+end
+
+return M
+
+end
 __mod["gen6.personal"] = function(...)
 -- Growth rate per species, read at runtime from the user's own game files
 -- (RomFS personal GARC). Nothing from the game is shipped or persisted; the
@@ -421,6 +1054,8 @@ local M = {}
 M.CANDIDATE_PATHS = { "/a/1/9/5", "/a/1/9/6" }
 M.ENTRY_SIZE = 0x50
 M.GROWTH_OFFSET = 0x15
+M.FORM_INDEX_OFFSET = 0x1C -- u16 FormStatsIndex (PKHeX PersonalInfoXY/ORAS), 0 = no extra forms
+M.FORM_COUNT_OFFSET = 0x20 -- u8 FormeCount
 M.MIN_ENTRIES = 722 -- species 0..721
 M.MAX_ATTEMPTS = 3
 
@@ -430,13 +1065,20 @@ function M.new(fb, opts)
   local esize = opts.entry_size or M.ENTRY_SIZE
   local goff = opts.growth_offset or M.GROWTH_OFFSET
   local self = {}
-  local rates, attempts = nil, 0
+  local rates, forms, attempts = nil, nil, 0
 
-  -- Returns a table species -> rate (1..721) or nil when data is not a personal table.
+  local function form_info(e, out_forms, s)
+    local idx = string.unpack("<I2", e, M.FORM_INDEX_OFFSET + 1)
+    local cnt = e:byte(M.FORM_COUNT_OFFSET + 1)
+    out_forms[s] = { index = idx, count = cnt }
+  end
+
+  -- Returns a table species -> rate (1..721) and a table species -> {index, count},
+  -- or nil when data is not a personal table.
   local function validate(data)
     local g = fb.codec.garc(data)
     if type(g) ~= "table" or type(g.count) ~= "number" then return nil end
-    local out = {}
+    local out, fo = {}, {}
     if g.count == 1 then
       local whole = fb.codec.garc_file(data, 1, 1)
       if type(whole) ~= "string" or #whole % esize ~= 0 or #whole // esize < M.MIN_ENTRIES then
@@ -446,6 +1088,7 @@ function M.new(fb, opts)
         local r = whole:byte(s * esize + goff + 1)
         if not r or r > 5 then return nil end
         out[s] = r
+        form_info(whole:sub(s * esize + 1, s * esize + esize), fo, s)
       end
     elseif g.count >= M.MIN_ENTRIES then
       for s = 1, M.MIN_ENTRIES - 1 do
@@ -454,11 +1097,12 @@ function M.new(fb, opts)
         local r = e:byte(goff + 1)
         if r > 5 then return nil end
         out[s] = r
+        form_info(e, fo, s)
       end
     else
       return nil
     end
-    return out
+    return out, fo
   end
 
   local function load()
@@ -471,9 +1115,9 @@ function M.new(fb, opts)
     for _, path in ipairs(paths) do
       local data = fb.rom.romfs(path)
       if type(data) == "string" then
-        local r = validate(data)
+        local r, fo = validate(data)
         if r then
-          rates = r
+          rates, forms = r, fo
           self.path = path
           if fb.log and fb.log.info then fb.log.info("personal data accepted at " .. path) end
           return true
@@ -490,9 +1134,24 @@ function M.new(fb, opts)
     return rates[species]
   end
 
+  -- Personal-table index of a species form (assumption, see docs): form 0 is the
+  -- species itself; form f > 0 is FormStatsIndex + f - 1 when 0 < f < FormeCount.
+  -- Returns the index, or nil, "not_ready" (table not readable) / "no_form".
+  function self.form_index(species, form)
+    if math.type(species) ~= "integer" or species < 1 or species >= M.MIN_ENTRIES then
+      return nil, "no_form"
+    end
+    form = form or 0
+    if form == 0 then return species end
+    if not load() then return nil, "not_ready" end
+    local f = forms[species]
+    if not f or f.index == 0 or form < 0 or form >= f.count then return nil, "no_form" end
+    return f.index + form - 1
+  end
+
   -- Forget failures and cached values (e.g. after a game change).
   function self.reset()
-    rates, attempts, self.path = nil, 0, nil
+    rates, forms, attempts, self.path = nil, nil, 0, nil
   end
 
   return self
@@ -660,6 +1319,7 @@ if adapter then
   local ticks, last = 0, nil
   fb.on_tick(function()
     ticks = ticks + 1
+    if type(adapter.tick) == "function" then adapter:tick() end
     if ticks % TEAM_EVERY ~= 0 then return end
     local team = api.team()
     if type(team) ~= "table" then return end
