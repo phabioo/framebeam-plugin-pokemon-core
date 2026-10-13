@@ -1,0 +1,217 @@
+local t = require("t")
+local fb_mock = require("fb_mock")
+local formats = require("formats")
+local crypto = require("pk6_crypto")
+local oras = require("gen6.oras")
+local icons = require("gen6.icons")
+local oras_location = require("gen6.oras_location")
+
+-- icon GARC: entry i+1 holds the icon with index i; first pixel red byte = i % 256
+local function icon_garc(count, w, h)
+  local files = { formats.bclim(w, h) }
+  for i = 1, count - 1 do
+    local px = string.char(i % 256, 0, 0, 255) .. string.rep("\0\0\0\255", w * h - 1)
+    files[#files + 1] = formats.bclim(w, h, px)
+  end
+  return formats.garc(files)
+end
+
+-- personal GARC (722 entries of 0x50): species 25 has form index 722 and 3 forms
+local function personal_garc()
+  local files = {}
+  for s = 0, 721 do
+    local e = {}
+    for i = 1, 0x50 do e[i] = "\0" end
+    if s == 25 then
+      e[0x1C + 1] = string.char(722 & 255); e[0x1C + 2] = string.char(722 >> 8)
+      e[0x20 + 1] = string.char(3)
+    end
+    files[#files + 1] = table.concat(e)
+  end
+  return formats.garc(files)
+end
+
+local REAL = "/a/0/9/4"
+
+local function romfs(extra)
+  local r = {
+    ["/a/0/0/1"] = string.rep("x", 1000),
+    ["/a/1/9/6"] = personal_garc(),
+    ["/a/2/4/7"] = icon_garc(800, 16, 16),                -- decoy: wrong image size
+    [REAL] = icon_garc(800, 40, 30),
+    ["/a/3/0/0"] = formats.garc({ string.rep("j", 400000) }), -- decoy: too few entries
+  }
+  for k, v in pairs(extra or {}) do r[k] = v end
+  return r
+end
+
+local function make(opts)
+  opts = opts or {}
+  local codec = formats.fake_codec()
+  codec.pk6_decrypt = crypto.decrypt
+  if opts.codec then for k, v in pairs(opts.codec) do codec[k] = v end end
+  local mock = fb_mock.new({ game = { system = "3ds" }, codec = codec, i18n_dir = "plugin/i18n",
+    romfs = opts.romfs or romfs(), cache = opts.cache, memory = opts.memory })
+  local reads = {}
+  local orig = mock.fb.rom.romfs
+  mock.fb.rom.romfs = function(p) reads[#reads + 1] = p; return orig(p) end
+  if opts.no_list then mock.fb.rom.romfs_list = nil end
+  local a = oras.attach({ fb = mock.fb, game = {}, detected = {} })
+  return a, mock, reads
+end
+
+local function run_until(a, pred, limit)
+  for _ = 1, limit or 20000 do
+    if pred() then return true end
+    a:tick()
+  end
+  return pred()
+end
+
+
+t.case("discovery finds the icon archive by content and flips the feature", function()
+  local a, mock = make()
+  t.eq(a:features().icons, false)
+  t.eq({ a:icon(25, 0) }, { nil, "not_ready" })
+  t.ok(run_until(a, function() return a:features().icons end), "found")
+  t.eq(mock.cache_files["icons/index.txt"], REAL .. "\n")
+end)
+
+t.case("icon maps species to entry, encodes PNG and caches it", function()
+  local a, mock, reads = make()
+  run_until(a, function() return a:features().icons end)
+  local png = a:icon(25, 0)
+  t.eq(png:sub(1, 8), "\137PNG\r\n\26\n")
+  t.eq({ string.unpack("<I2I2", png, 9) }, { 40, 30, 13 })
+  t.eq(png:byte(13), 25)
+  t.eq(mock.cache_files["icons/25-0.png"], png)
+  local n = #reads
+  t.eq(a:icon(25, 0), png)
+  t.eq(#reads, n, "second call served from cache")
+  t.eq(a:icon(1):byte(13), 1) -- form defaults to 0
+  t.eq(a:icon(721):byte(13), 721 % 256)
+end)
+
+t.case("forms use the personal form index, otherwise the base icon", function()
+  local a, mock = make()
+  run_until(a, function() return a:features().icons end)
+  t.eq(a:icon(25, 1):byte(13), 722 % 256)
+  t.ok(mock.cache_files["icons/25-1.png"])
+  t.eq(a:icon(25, 2):byte(13), 723 % 256)
+  local base = a:icon(25, 3) -- FormeCount is 3: form 3 does not exist
+  t.eq(base:byte(13), 25)
+  t.eq(mock.cache_files["icons/25-3.png"], nil, "fallback is not cached under the form key")
+  t.eq(a:icon(4, 1):byte(13), 4) -- species without extra forms
+end)
+
+t.case("invalid arguments", function()
+  local a = make()
+  for _, args in ipairs({ { 0 }, { 722 }, { "x" }, { 1.5 }, { 25, -1 }, { 25, "a" } }) do
+    t.eq({ a:icon(table.unpack(args)) }, { nil, "unknown_species" })
+  end
+end)
+
+t.case("later starts use the stored index and skip the scan", function()
+  local a, _, reads = make({ cache = { ["icons/index.txt"] = REAL .. "\n" } })
+  a:icon(25, 0) -- one step
+  t.eq(reads[1], REAL)
+  t.ok(a:features().icons)
+end)
+
+t.case("a stale index is revalidated and discovery continues", function()
+  local a = make({ cache = { ["icons/index.txt"] = "/a/2/4/7\n" } })
+  t.ok(run_until(a, function() return a:features().icons end))
+end)
+
+t.case("config override path is tried first", function()
+  local a, _, reads = make({ cache = { ["config/icon_garc.txt"] = REAL } })
+  a:icon(1)
+  t.eq(reads[1], REAL)
+end)
+
+t.case("no archive: unsupported after the scan", function()
+  local r = romfs(); r[REAL] = nil
+  local a = make({ romfs = r })
+  t.ok(run_until(a, function() return select(2, a:icon(25)) == "unsupported" end))
+  t.eq(a:features().icons, false)
+end)
+
+t.case("missing codec or romfs_list: unsupported at once", function()
+  local a = make({ no_list = true })
+  t.eq({ a:icon(25) }, { nil, "unsupported" })
+  local b = make({ codec = { bclim = false } })
+  t.eq({ b:icon(25) }, { nil, "unsupported" })
+end)
+
+t.case("a single tick does at most one directory listing or candidate read", function()
+  local a, mock, reads = make()
+  local lists = 0
+  local orig = mock.fb.rom.romfs_list
+  mock.fb.rom.romfs_list = function(d) lists = lists + 1; return orig(d) end
+  for _ = 1, icons.MAX_STEPS do
+    local l0, r0 = lists, #reads
+    a:icon(25)
+    t.ok((lists - l0) + (#reads - r0) <= 2, "bounded work per call") -- icon() + personal never both heavy
+    if a:features().icons then break end
+  end
+end)
+
+t.case("interface info reports icons only once found", function()
+  local interface = require("core.interface")
+  local a = make()
+  local api = interface.new({ id = "x", name = "x", gen = 6, system = "3ds", version = "v" }, {}, a)
+  t.eq(api.info().features.icons, false)
+  run_until(a, function() return a:features().icons end)
+  t.eq(api.info().features.icons, true)
+  t.eq(api.icon(0), nil)
+end)
+
+-- location
+
+local ZONE = 0x08C12340
+local function zone_mem(v) return { { addr = ZONE, data = string.pack("<I2", v) } } end
+
+t.case("location unsupported without any address", function()
+  local a = make()
+  t.eq({ a:location() }, { nil, "unsupported" })
+  t.eq(a:features().location, false)
+end)
+
+t.case("location from cache override address", function()
+  local a, mock = make({ cache = { ["config/zone_addr.txt"] = "0x08C12340\n" }, memory = zone_mem(0x0123) })
+  t.eq(a:location(), { zone = 0x123, source = "memory" })
+  t.eq(a:features().location, true)
+  t.eq(mock.watches["oras.zone"], { addr = ZONE, len = 2 })
+end)
+
+t.case("location not_ready when the address is not readable; bad override ignored", function()
+  local a = make({ cache = { ["config/zone_addr.txt"] = "08C12340" } })
+  t.eq({ a:location() }, { nil, "not_ready" })
+  local b = make({ cache = { ["config/zone_addr.txt"] = "banana" } })
+  t.eq({ b:location() }, { nil, "unsupported" })
+end)
+
+t.case("ZONE_ADDR table entry is used for the detected revision", function()
+  local build = require("pk6_build")
+  local REV2 = { party = 0x08CF727C }
+  oras_location.ZONE_ADDR.rev2 = ZONE
+  local ok, err = pcall(function()
+    local mem = zone_mem(77)
+    mem[#mem + 1] = { addr = REV2.party, data = build.encrypted({ species = 25, party = {} }) }
+    local a = make({ memory = mem })
+    t.eq({ a:location() }, { nil, "not_ready" }, "revision not yet known")
+    a:team()
+    t.eq(a:location(), { zone = 77, source = "memory" })
+    t.eq(a:features().location, true)
+  end)
+  oras_location.ZONE_ADDR.rev2 = nil
+  assert(ok, err)
+end)
+
+t.case("parse_addr", function()
+  t.eq(oras_location.parse_addr("0x10"), 16)
+  t.eq(oras_location.parse_addr(" 10 "), 16)
+  t.eq(oras_location.parse_addr("0"), nil)
+  t.eq(oras_location.parse_addr("123456789"), nil)
+  t.eq(oras_location.parse_addr(nil), nil)
+end)

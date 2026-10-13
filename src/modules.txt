@@ -7,3 +7,7 @@ gen6.oras
 gen6.personal
 gen6.pk6
 main
+gen6.icons
+gen6.oras_location
+gen6.darc
+gen6.maps

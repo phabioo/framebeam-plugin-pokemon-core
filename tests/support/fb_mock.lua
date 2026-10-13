@@ -70,7 +70,7 @@ function M.new(opts)
   local mock = { logs = {}, events = {}, provided = {}, watches = {}, dev_watches = {}, cache_files = {} }
   local regions = opts.memory or {}
   mock.regions = regions
-  local fb = { api = 1, plugin = { id = "net.framebeam.pokemon-core", version = "0.1.0" } }
+  local fb = { api = 1, plugin = { id = "net.framebeam.pokemon-core", version = "0.2.0" } }
   fb.game = opts.game or {}
   if opts.language and not fb.game.language then fb.game.language = opts.language end
   mock.fb = fb
@@ -101,6 +101,8 @@ function M.new(opts)
     bytes = function(addr, len) return read(addr, len) end,
     frame = function() return opts.frame or 1 end,
   }
+
+  for k, v in pairs(opts.cache or {}) do mock.cache_files[k] = v end
 
   local romfs = opts.romfs or {}
   fb.rom = {

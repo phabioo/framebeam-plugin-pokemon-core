@@ -1,6 +1,6 @@
 # Pokemon Omega Ruby / Alpha Sapphire (3DS, Gen 6)
 
-Adapter: `src/gen6/oras.lua` (module `gen6.oras`), v0.1. Backed methods: `revision`, `language` (heuristic, see open points), `team`, `box`, `box_count`. Not implemented (offsets unknown): location, battle, encounters, badges.
+Adapter: `src/gen6/oras.lua` (module `gen6.oras`), plugin v0.2.0. Backed methods: `revision`, `language` (heuristic, see open points), `team`, `box`, `box_count`, `icon`, `map_candidates`, `map_image`, `map_selected` (all RomFS based, see below), `location` (only with a configured address). Not implemented (offsets unknown): battle, encounters, badges.
 
 ## Detection
 
@@ -54,12 +54,39 @@ Growth rate per species is read at runtime from the user's own RomFS via `fb.rom
 
 If RomFS is unreadable (encrypted game, wrong path) `level` stays nil.
 
+## Location (zone id)
+
+`src/gen6/oras_location.lua`. `location()` returns `{ zone = <u16>, source = "memory" }`. The RAM address of the current zone id is **not known yet** (to find with a local probe). `ZONE_ADDR` (keyed by revision name `rev2` / `rev0_1`) is empty ("fill from local probe"). Until then an address can be given without a release: write it in hex (`0x08C12345`) into the plugin cache file `config/zone_addr.txt`; it applies to any revision, wins over `ZONE_ADDR`, is read once at attach (reload the plugin) and is watched as 2 bytes. `features.location` is true only when an address is configured; without one `location()` returns `nil, "unsupported"`, with an unreadable address `nil, "not_ready"`. The u16 width is an assumption (zone ids are u16 in the Gen 6 zone/world data; the live variable's width is unverified).
+
+## Icons
+
+`src/gen6/icons.lua`. `icon(species, form)` returns the PNG of the box icon (`fb.codec.bclim` + `fb.codec.png`). No path is hardcoded. Assumptions to verify locally:
+
+- Discovery: `fb.rom.romfs_list` walked recursively from `/a`, one directory or one candidate per step. Candidates are files of 256 KiB to 16 MiB (thresholds are assumptions). A candidate is accepted when `fb.codec.garc` reports 700 to 1100 entries and the entries of species 1, 25, 150, 300, 500, 700 (GARC entry species + 1, sub-file 1) decode as BCLIM with a size in {40x30, 32x32, 64x32}. Wrong size set or entry range makes discovery fail (`icon` then returns `nil, "unsupported"`; the log says "no box icon archive found"). A path can be forced by writing it into the cache file `config/icon_garc.txt` (it is still validated).
+- Mapping: base species i at GARC entry i + 1 (1-based; entry 0 is assumed a dummy). Form f > 0 uses the personal-table form index: entry = `FormStatsIndex + f - 1` where `FormStatsIndex` is the u16 at personal entry offset `0x1C` and `FormeCount` the byte at `0x20` (PKHeX PersonalInfoXY/ORAS; recalled, unverified), valid for `0 < f < FormeCount`. This assumes the icon archive is indexed like the personal table (forms after the base list). Otherwise, or when the personal table is unreadable, the base icon is returned and not cached under the form key.
+- Cache: `icons/<species>-<form>.png`, index `icons/index.txt` (path of the archive, validated again on the next start). `features.icons` becomes true when the archive is found; discovery starts after 90 ticks.
+- The decoded BCLIM is whatever `fb.codec.bclim` returns (size 40x30 expected); the PNG keeps that size.
+
+## Region map
+
+`src/gen6/maps.lua`, `src/gen6/darc.lua`. The real map image is read from the user's game, none is drawn.
+
+- Scan: all RomFS files from `/a` (files larger than 32 MiB or smaller than 64 bytes are skipped). One file is read per step. In each file: if `fb.codec.garc` parses it, every entry (sub-file 1, at most 5000 per file, 16 per step) is examined, otherwise the file itself is entry 1. An entry is checked as plain BCLIM (footer `CLIM` + `imag`), as LZ10/LZ11 data (first byte 0x10/0x11, compressed size up to 2 MiB, decompressed up to 4 MiB, then re-checked once) and as DARC (magic `darc`, files checked as BCLIM regardless of name).
+- Threshold: decoded size at least 256 px wide and 128 px high. The size is read from the `imag` header (equals the decoded size); candidates are not decoded during the scan. Up to 2000 candidates are stored, `map_candidates()` returns the 40 largest by area.
+- id = `<romfs path>#<garc entry, 1-based>[/<darc file path>]`, a loose BCLIM file uses entry 1.
+- DARC layout (3dbrew, recalled, unverified on real files): header `darc`, BOM, header size, version, file size, table offset, table length, data offset; 12-byte table entries (name offset with flag byte 1 = directory; directories hold parent and end index, files hold data offset and length); names UTF-16LE behind the table. Only ASCII names are kept, other characters become `?`; directory depth up to 16.
+- Cache: `map/index.txt` (`complete`/`partial` + `id`, width, height), `map/files.txt`, `map/progress.txt` (files finished; saved every 10 files, resumable), PNGs `map/<hash>.png` (djb2 of the id). A PNG above 1 MiB gives `nil, "too_large"`. `features.map` is true when the scan finished with at least one candidate; map scan starts after 120 ticks.
+- `map_selected()` reads `MAP_ID` in `maps.lua` (empty: "fill after Fabio confirms"), keyed by game id (`pokemon_omega_ruby`), optionally a table per revision name.
+- Open: whether the region map is a BCLIM at all (it may be in another format such as a texture inside a model archive, which this scan does not find), its real size, and whether it is LZ-wrapped or in a DARC. Several candidates will show up; the maintainer chooses with `map_candidates()`/`map_image()`.
+
 ## Open points
+
+- Zone id RAM address (see Location), icon archive path and sizes, map image location (see above); all RomFS assumptions are verified only against synthetic data.
 
 - Party stride/order with 3 or more members, and maximum slots in live memory.
 - Where live level/HP/status are kept (the `0xEC` byte is unusable at the Rev 2 party address).
 - Language: no save-block offset is sourced (open). `language()` is a heuristic: party records whose origin game byte (`0xDF`) is Alpha Sapphire (26) or Omega Ruby (27) (PKHeX `GameVersion`: X 24, Y 25, AS 26, OR 27; recalled, not re-fetched) are grouped by OT ID/SID; the largest group (earliest slot on ties) is the player's own catches and its first member's language byte (`0xE3`) is returned, else nil. A Pokemon traded in from an OR/AS cartridge of another language can fool it, and it returns nil with only foreign-origin Pokemon in the party.
 - Boxes beyond box 1 slot 1: contiguity and stride in live memory unverified.
-- Location, battle, encounters, badges: no offsets.
+- Battle, encounters, badges: no offsets.
 - Alpha Sapphire, other regions/languages, Rev 0/1 (community addresses only), update-patch variants.
 - Personal GARC path, shape and offsets (see above).

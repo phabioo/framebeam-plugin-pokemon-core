@@ -1,9 +1,13 @@
 -- Adapter for Pokemon Omega Ruby / Alpha Sapphire (3DS, Gen 6).
 -- Addresses: docs/games/omega-ruby-alpha-sapphire.md. Only team, boxes and
--- revision are backed; location/battle/encounters/badges are not implemented.
+-- revision are backed, plus icon() (gen6.icons) and location() (gen6.oras_location,
+-- active only once a zone address is configured); battle/encounters/badges are not implemented.
 local pk6 = require("gen6.pk6")
 local growth = require("gen6.growth")
 local personal = require("gen6.personal")
+local icons = require("gen6.icons")
+local maps = require("gen6.maps")
+local oras_location = require("gen6.oras_location")
 
 local M = {}
 
@@ -13,6 +17,10 @@ M.PARTY_SIZE = pk6.SIZE_PARTY
 M.BOX_COUNT = 31
 M.BOX_SLOTS = 30
 M.BOX_SIZE = pk6.SIZE_STORED
+M.ICON_START_TICK = 90 -- ticks before icon discovery starts
+M.ICON_STEP_EVERY = 8  -- ticks between discovery steps
+M.MAP_START_TICK = 120 -- map scan starts later; steps are offset from icon steps
+M.MAP_STEP_EVERY = 8 -- steps fall on the odd half of the icon cadence
 M.ORIGIN_AS, M.ORIGIN_OR = 26, 27 -- PKHeX GameVersion (X 24, Y 25)
 
 -- Candidate address sets, checked in this order.
@@ -38,6 +46,10 @@ end
 function M.attach(ctx)
   local fb = ctx.fb
   local pers = personal.new(fb)
+  local icon_store = icons.new(fb, pers)
+  local zone = oras_location.new(fb)
+  local ticks = 0
+  local map_store
   local chosen
 
   for _, set in ipairs(M.REVISIONS) do
@@ -60,6 +72,7 @@ function M.attach(ctx)
   end
 
   local obj = {}
+  map_store = maps.new(fb, ctx.game and ctx.game.id, function() return chosen and chosen.name end)
 
   function obj:revision()
     local set = detect()
@@ -89,6 +102,34 @@ function M.attach(ctx)
       if not best or groups[key].n > best.n then best = groups[key] end
     end
     return best and best.first.language or nil
+  end
+
+  -- Called every tick by main.lua: spreads icon discovery over many ticks.
+  function obj:tick()
+    ticks = ticks + 1
+    if ticks >= M.MAP_START_TICK and ticks % M.MAP_STEP_EVERY == M.MAP_STEP_EVERY // 2 and map_store.state() ~= "done" then
+      map_store.step()
+    end
+    if ticks >= M.ICON_START_TICK and ticks % M.ICON_STEP_EVERY == 0 and icon_store.state() ~= "done" then
+      icon_store.step()
+    end
+  end
+
+  -- Feature overrides: icons only once the GARC is found, location only with an address.
+  function obj:features()
+    return { icons = icon_store.found(), location = zone.configured(), map = map_store.found() }
+  end
+
+  function obj:icon(species, form)
+    return icon_store.icon(species, form)
+  end
+
+  function obj:map_candidates() return map_store.candidates() end
+  function obj:map_image(id) return map_store.image(id) end
+  function obj:map_selected() return map_store.selected() end
+
+  function obj:location()
+    return zone.zone(chosen and chosen.name or nil)
   end
 
   function obj:team()

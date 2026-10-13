@@ -1,10 +1,11 @@
 -- Builds the table for fb.provide("pokemon.core", tbl).
 local M = {}
 
-local METHODS = { "team", "box", "box_count", "location", "battle", "encounters", "badges" }
+local METHODS = { "team", "box", "box_count", "location", "battle", "encounters", "badges", "icon",
+  "map_candidates", "map_image", "map_selected" }
 local FEATURE = {
   team = "team", box = "box", location = "location",
-  battle = "battle", encounters = "encounters", badges = "badges",
+  battle = "battle", encounters = "encounters", badges = "badges", icon = "icons", map_candidates = "map",
 }
 
 local function has(adapter, name)
@@ -18,6 +19,13 @@ function M.new(entry, detected, adapter)
   function api.info()
     local features = {}
     for method, key in pairs(FEATURE) do features[key] = has(adapter, method) end
+    -- An adapter may refine features that depend on runtime state (icons found, address set).
+    if has(adapter, "features") then
+      local over = adapter:features()
+      if type(over) == "table" then
+        for k, v in pairs(over) do features[k] = v == true end
+      end
+    end
     local language = detected and detected.language or nil
     if has(adapter, "language") then language = adapter:language() or language end
     local revision
