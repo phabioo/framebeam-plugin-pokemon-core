@@ -7,11 +7,15 @@
 --           whose data validates as a personal table is used (see validate)
 --   entry : 0x50 bytes per species (PKHeX PersonalInfoORAS), index = Dex number
 --   growth: byte 0x15 of the entry (PersonalInfoORAS.EXPGrowth), values 0..5
--- Accepted shapes: one file with length % 0x50 == 0 and >= 722 entries, or
--- >= 722 files of 0x50 bytes (file species + 1 is the entry of that species).
+--   types : bytes 0x06 / 0x07 (Type1 / Type2, same value = single type)
+-- /a/1/9/5 is the confirmed ORAS path (pk3DS GARCReference); the LAST GARC file holds the whole
+-- table concatenated (pk3DS GameConfig). Accepted shapes: the last file (or the only one) with
+-- length % 0x50 == 0 and >= 722 entries, or >= 722 files of 0x50 bytes (file species + 1 is the
+-- entry of that species).
 local M = {}
 
 M.CANDIDATE_PATHS = { "/a/1/9/5", "/a/1/9/6" }
+M.TYPE_OFFSET = 0x06 -- Type1, Type2 follows
 M.ENTRY_SIZE = 0x50
 M.GROWTH_OFFSET = 0x15
 M.FORM_INDEX_OFFSET = 0x1C -- u16 FormStatsIndex (PKHeX PersonalInfoXY/ORAS), 0 = no extra forms
@@ -26,6 +30,7 @@ function M.new(fb, opts)
   local goff = opts.growth_offset or M.GROWTH_OFFSET
   local self = {}
   local rates, forms, attempts = nil, nil, 0
+  local whole_data, garc_data -- entry source: concatenated table, or the GARC itself
 
   local function form_info(e, out_forms, s)
     local idx = string.unpack("<I2", e, M.FORM_INDEX_OFFSET + 1)
@@ -33,23 +38,23 @@ function M.new(fb, opts)
     out_forms[s] = { index = idx, count = cnt }
   end
 
-  -- Returns a table species -> rate (1..721) and a table species -> {index, count},
-  -- or nil when data is not a personal table.
+  -- Returns a table species -> rate (1..721), a table species -> {index, count} and the source of
+  -- the entries ("whole", string | "files"), or nil when data is not a personal table.
   local function validate(data)
     local g = fb.codec.garc(data)
     if type(g) ~= "table" or type(g.count) ~= "number" then return nil end
     local out, fo = {}, {}
-    if g.count == 1 then
-      local whole = fb.codec.garc_file(data, 1, 1)
-      if type(whole) ~= "string" or #whole % esize ~= 0 or #whole // esize < M.MIN_ENTRIES then
-        return nil
-      end
+    local whole
+    local last = fb.codec.garc_file(data, g.count, 1)
+    if type(last) == "string" and #last % esize == 0 and #last // esize >= M.MIN_ENTRIES then whole = last end
+    if whole then
       for s = 1, M.MIN_ENTRIES - 1 do
         local r = whole:byte(s * esize + goff + 1)
         if not r or r > 5 then return nil end
         out[s] = r
         form_info(whole:sub(s * esize + 1, s * esize + esize), fo, s)
       end
+      return out, fo, whole
     elseif g.count >= M.MIN_ENTRIES then
       for s = 1, M.MIN_ENTRIES - 1 do
         local e = fb.codec.garc_file(data, s + 1, 1)
@@ -59,10 +64,9 @@ function M.new(fb, opts)
         out[s] = r
         form_info(e, fo, s)
       end
-    else
-      return nil
+      return out, fo, nil
     end
-    return out, fo
+    return nil
   end
 
   local function load()
@@ -75,9 +79,9 @@ function M.new(fb, opts)
     for _, path in ipairs(paths) do
       local data = fb.rom.romfs(path)
       if type(data) == "string" then
-        local r, fo = validate(data)
+        local r, fo, whole = validate(data)
         if r then
-          rates, forms = r, fo
+          rates, forms, whole_data, garc_data = r, fo, whole, data
           self.path = path
           if fb.log and fb.log.info then fb.log.info("personal data accepted at " .. path) end
           return true
@@ -109,9 +113,31 @@ function M.new(fb, opts)
     return f.index + form - 1
   end
 
+  -- Raw personal entry of a table index, or nil.
+  local function raw_entry(idx)
+    if whole_data then
+      local e = whole_data:sub(idx * esize + 1, idx * esize + esize)
+      return #e == esize and e or nil
+    end
+    local e = fb.codec.garc_file(garc_data, idx + 1, 1)
+    return (type(e) == "string" and #e == esize) and e or nil
+  end
+
+  -- { types = { t1, t2 }, growth } of a species form, or nil, "not_ready" | "unknown_species" | "no_form".
+  function self.info(species, form)
+    if math.type(species) ~= "integer" or species < 1 or species >= M.MIN_ENTRIES then
+      return nil, "unknown_species"
+    end
+    local idx, err = self.form_index(species, form)
+    if not idx then return nil, err end
+    local e = raw_entry(idx)
+    if not e then return nil, "no_form" end
+    return { types = { e:byte(M.TYPE_OFFSET + 1), e:byte(M.TYPE_OFFSET + 2) }, growth = e:byte(goff + 1) }
+  end
+
   -- Forget failures and cached values (e.g. after a game change).
   function self.reset()
-    rates, forms, attempts, self.path = nil, nil, 0, nil
+    rates, forms, whole_data, garc_data, attempts, self.path = nil, nil, nil, nil, 0, nil
   end
 
   return self

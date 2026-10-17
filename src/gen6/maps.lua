@@ -23,8 +23,14 @@ M.SAVE_EVERY = 10                   -- files between progress writes
 M.INDEX = "map/index.txt"           -- "complete" or "partial", then id TAB w TAB h lines
 M.FILES = "map/files.txt"           -- sorted list of scanned file paths
 M.PROGRESS = "map/progress.txt"     -- number of files fully scanned
+-- Archives named in the Project Pokemon ORAS file list as town map UI / PokeNav screens: scanned first.
+M.PRIORITY = { "/a/0/6/7", "/a/0/6/8", "/a/2/4/8", "/a/2/7/6" }
+-- Noise filter: a decoded candidate is dropped when more than NOISE_RATIO of the sampled
+-- neighbouring pixel pairs differ by more than NOISE_DIFF (sum of the RGB differences, max 765).
+M.NOISE_DIFF, M.NOISE_RATIO, M.NOISE_MIN_PAIRS = 96, 0.5, 200
+M.NOISE_ROWS, M.NOISE_COLS = 64, 128 -- sample grid (bounds the work per candidate)
 
--- Map id per game id, optionally per revision: MAP_ID[game_id] = "<id>" or { rev2 = "<id>" }.
+-- Map id per game id, optionally per revision: MAP_ID[game_id] = "<id>" or { ["v1.0"] = "<id>" }.
 -- Fill after the maintainer confirms the region map image.
 M.MAP_ID = {}
 
@@ -41,6 +47,28 @@ local function hash(id)
   local h = 5381
   for i = 1, #id do h = (h * 33 + id:byte(i)) & 0xFFFFFFFF end
   return string.format("%08x", h)
+end
+
+-- True when the decoded image { width, height, rgba } looks like noise (garbage decode of a wrong
+-- candidate): real maps and UI textures have large smooth areas, noise differs at almost every pixel.
+function M.noisy(img)
+  if type(img) ~= "table" or type(img.rgba) ~= "string" then return false end
+  local w, h, px = img.width, img.height, img.rgba
+  if type(w) ~= "number" or type(h) ~= "number" or w < 2 or h < 1 or #px < w * h * 4 then return false end
+  local ystep = math.max(1, h // M.NOISE_ROWS)
+  local xstep = math.max(1, (w - 1) // M.NOISE_COLS)
+  local pairs_n, strong = 0, 0
+  for y = 0, h - 1, ystep do
+    for x = 0, w - 2, xstep do
+      local o = (y * w + x) * 4 + 1
+      local r1, g1, b1, a1, r2, g2, b2, a2 = px:byte(o, o + 7)
+      if a1 ~= 0 or a2 ~= 0 then
+        pairs_n = pairs_n + 1
+        if math.abs(r1 - r2) + math.abs(g1 - g2) + math.abs(b1 - b2) > M.NOISE_DIFF then strong = strong + 1 end
+      end
+    end
+  end
+  return pairs_n >= M.NOISE_MIN_PAIRS and strong / pairs_n > M.NOISE_RATIO
 end
 
 -- "<path>#<entry>[/<darc path>]" -> path, entry, sub
@@ -99,8 +127,14 @@ function M.new(fb, game_id, revision_fn)
     state = "dirs"
   end
 
-  local function add(id, w, h)
+  -- bclim: the BCLIM bytes; the candidate is decoded once and dropped when the image is mostly noise
+  -- (a failed decode keeps it: only proven garbage is dropped).
+  local function add(id, w, h, bclim)
     if w >= M.MIN_W and h >= M.MIN_H and #cands < M.MAX_CANDIDATES then
+      if bclim and codec.bclim then
+        local ok, img = pcall(codec.bclim, bclim)
+        if ok and type(img) == "table" and M.noisy(img) then return end
+      end
       cands[#cands + 1] = { id = id, w = w, h = h }
     end
   end
@@ -110,14 +144,15 @@ function M.new(fb, game_id, revision_fn)
     -- DARC first: its last member may end in a BCLIM footer that would pass for the archive's own
     if s:sub(1, 4) ~= "darc" then
       local w, h = M.bclim_size(s)
-      if w then add(id, w, h) end
+      if w then add(id, w, h, s) end
     else
       local list = darc.parse(s)
       if list then
         for _, f in ipairs(list) do
           if f.length >= 40 then
-            local fw, fh = M.bclim_size(s:sub(f.offset + 1, f.offset + f.length))
-            if fw then add(id .. "/" .. f.path, fw, fh) end
+            local sub = s:sub(f.offset + 1, f.offset + f.length)
+            local fw, fh = M.bclim_size(sub)
+            if fw then add(id .. "/" .. f.path, fw, fh, sub) end
           end
         end
       end
@@ -189,6 +224,15 @@ function M.new(fb, game_id, revision_fn)
         scan_dir(table.remove(dirs, 1))
       else
         table.sort(files)
+        -- the forum-listed town map archives first, then the rest in path order
+        local first, rest, is_prio = {}, {}, {}
+        for _, p in ipairs(M.PRIORITY) do is_prio[p] = true end
+        for _, p in ipairs(M.PRIORITY) do
+          for _, f in ipairs(files) do if f == p then first[#first + 1] = f; break end end
+        end
+        for _, f in ipairs(files) do if not is_prio[f] then rest[#rest + 1] = f end end
+        files = first
+        for _, f in ipairs(rest) do files[#files + 1] = f end
         cwrite(M.FILES, table.concat(files, "\n") .. "\n")
         cwrite(M.PROGRESS, "0")
         fidx, state = 0, "files"

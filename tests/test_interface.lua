@@ -13,8 +13,9 @@ t.case("no adapter: unsupported everywhere", function()
   t.eq(info.language, "de")
   t.eq(info.revision, nil)
   t.eq(info.features, { team = false, box = false, location = false, battle = false, encounters = false, badges = false,
-    icons = false, map = false })
-  for _, m in ipairs({ "team", "box_count", "location", "battle", "encounters", "badges", "icon", "map_candidates", "map_image", "map_selected" }) do
+    icons = false, map = false, names = false, areas = false, trainer = false, live_stats = false })
+  for _, m in ipairs({ "team", "box_count", "location", "battle", "encounters", "badges", "icon", "map_candidates", "map_image",
+    "map_selected", "trainer", "name", "species_info", "areas", "zone_info" }) do
     local v, err = api[m]()
     t.eq(v, nil); t.eq(err, "unsupported", m)
   end

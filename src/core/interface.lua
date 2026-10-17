@@ -1,11 +1,12 @@
 -- Builds the table for fb.provide("pokemon.core", tbl).
 local M = {}
 
-local METHODS = { "team", "box", "box_count", "location", "battle", "encounters", "badges", "icon",
-  "map_candidates", "map_image", "map_selected" }
+local METHODS = { "team", "box", "box_count", "location", "battle", "encounters", "badges", "trainer", "name",
+  "species_info", "areas", "zone_info", "icon", "map_candidates", "map_image", "map_selected" }
 local FEATURE = {
   team = "team", box = "box", location = "location",
-  battle = "battle", encounters = "encounters", badges = "badges", icon = "icons", map_candidates = "map",
+  battle = "battle", encounters = "encounters", badges = "badges", trainer = "trainer", name = "names",
+  areas = "areas", icon = "icons", map_candidates = "map",
 }
 
 local function has(adapter, name)
@@ -17,7 +18,7 @@ function M.new(entry, detected, adapter)
   local api = {}
 
   function api.info()
-    local features = {}
+    local features = { live_stats = false }
     for method, key in pairs(FEATURE) do features[key] = has(adapter, method) end
     -- An adapter may refine features that depend on runtime state (icons found, address set).
     if has(adapter, "features") then

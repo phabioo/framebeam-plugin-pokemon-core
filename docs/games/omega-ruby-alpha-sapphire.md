@@ -1,6 +1,8 @@
 # Pokemon Omega Ruby / Alpha Sapphire (3DS, Gen 6)
 
-Adapter: `src/gen6/oras.lua` (module `gen6.oras`), plugin v0.2.0. Backed methods: `revision`, `language` (heuristic, see open points), `team`, `box`, `box_count`, `icon`, `map_candidates`, `map_image`, `map_selected` (all RomFS based, see below), `location` (only with a configured address). Not implemented (offsets unknown): battle, encounters, badges.
+Adapter: `src/gen6/oras.lua` (module `gen6.oras`), plugin v0.3.0. Backed methods: `revision`, `language`, `team` (with live stats), `box`, `box_count`, `trainer`, `badges`, `location`, `battle`, `encounters`, `name`, `species_info`, `areas`, `zone_info`, `icon`, `map_candidates`, `map_image`, `map_selected`. Helper modules: `gen6.oras_addr` (address tables and overrides), `gen6.oras_battle`, `gen6.text`, `gen6.zones`, `gen6.personal`, `gen6.icons`, `gen6.maps`, `gen6.darc`, `gen6.pk6`, `gen6.growth`.
+
+Sources are cited as `RAM §n` (research notes `research-ram.md`, sections 0-8) and `ROMFS §n` (`research-romfs.md`, sections 1-7). The research notes are maintainer notes and are not in this repository; their primary sources are named in each row. Confidence letters follow the research: V verified in source code, F forum/wiki list only, I inferred.
 
 ## Detection
 
@@ -11,82 +13,139 @@ Adapter: `src/gen6/oras.lua` (module `gen6.oras`), plugin v0.2.0. Backed methods
 
 Other regions of the same games may use other title IDs (open; only the IDs above are detected today).
 
-## Revisions and addresses
+## Revisions
 
-3DS virtual addresses (heap `0x08000000`-`0x08CFFFFF` readable on the test setup).
+A revision is the **game update, not the region** (RAM §0). The maintainer's Omega Ruby EUR game ("Rev 2" in the old notes) runs ORAS **v1.0** (no update). The addresses used by most community tools (PKMN-NTR, PokeReader, CitraRNG, Gen6CTRPF) are for **v1.4** (title version 7820). In the save-data heap range `0x08C6xxxx`-`0x08CFxxxx`, v1.4 = v1.0 + `0x3FF0`, proven by the CTRPF cheat DB (`[Money 999998]` `08C71DC0` vs `[Max Money, Game v1.0]` `08C6DDD0`), the Citra-Tracker v1.0 constants and the maintainer's own measurement (party `0x08CF727C`, box `0x08C9A144`). For the battle heap (`0x081Fxxxx`, `0x0820xxxx`, `0x0880xxxx`) the shift is **not** proven; the v1.0 battle addresses come from a different source (see Battle).
 
-| What | Address | State |
-|---|---|---|
-| rev2 party slot 1 | `0x08CF727C` | verified, Omega Ruby EUR Rev 2, maintainer, 2026-10-12 (checksum valid, species plausible) |
-| rev2 party member 2 | `0x08CF7644` (= slot 1 + `0x3C8` = 2 x `0x1E4`) | verified once, 2 members only |
-| rev2 box 1 slot 1 | `0x08C9A144` | verified, same session |
-| rev0_1 party slot 1 | `0x08CFB26C` | community address, unverified (= rev2 + `0x3FF0`) |
-| rev0_1 box 1 slot 1 | `0x08C9E134` | community address, unverified (= rev2 + `0x3FF0`) |
+Old names `rev2` / `rev0_1` became `v1.0` / `v1.4` (watch keys, `MAP_ID`). Detection at runtime: the first revision (v1.0, then v1.4) whose party slot 1 decrypts with a valid checksum and species 1..721 is chosen; the watches of the other revision are released. Then a **cross-check**: the MyStatus TID must equal the OT TID of at least one party member of own origin (origin game 26/27); a mismatch logs the warning `revision cross-check failed ...` once. No verdict (and no warning) is made while no own-origin member is in the party (retried every 30th tick). The cross-check does not switch the revision; Fabio corrects addresses with the override file below.
 
-Revision is chosen at runtime: the first set (rev2, then rev0_1) whose party slot 1 decrypts with a valid checksum and species 1..721. Both sets are watched (party 6 x `0x1E4` bytes, box 31 x 30 x 232 bytes). The finding file is `notes/oras-memory/findings-2026-10-12.md` (maintainer notes, not in this repository).
+Status letters in the table: **M** measured (first-hand or measured by tools on exactly that version), **D** derived (v1.4 community value minus `0x3FF0`, nobody measured it on v1.0), **C** community value for v1.4 (several tools agree, hardware or Citra), **U** unverified (single source, other source version or arithmetic). `-` = no address known (reported open, not guessed).
 
-Layout constants (named in `oras.lua`):
+## Address table
 
-- Party: 6 slots, stride `PARTY_STRIDE = 0x1E4`, 260 bytes each. The stride is inferred from two members; order and stride are open.
-- Boxes: 31 boxes x 30 slots x 232 bytes, assumed contiguous from box 1 slot 1 (as in the save block). Only box 1 slot 1 was verified; other boxes are unverified.
+Virtual 3DS addresses (heap `0x08000000`-`0x08CFFFFF` readable on the test setup). Key = name for overrides and watches (`oras.<revision>.<key>`).
+
+| Key | What (offsets inside) | Watched bytes | v1.0 | State | v1.4 | State | Source |
+|---|---|---|---|---|---|---|---|
+| `party` | 6 slots, stride `0x1E4`; per slot encrypted PK6 `0xE8` bytes at +0, 22 encrypted party-stat bytes at +0x158 | `0xB58` | `0x08CF727C` | M | `0x08CFB26C` | C | RAM §1, §2: NTR LookupTable.cs L838; PokeReader reader.rs L76, L190-193; CitraRNG manager_oras.py L10; v1.0: PokeStreamer-Tools L366, Citra-Tracker `citra-updater.py` L799; maintainer measurement 2026-10-12 |
+| `box` | 31 boxes x 30 x 232 bytes (EK6, contiguous) | `0x34AD0` (215760) | `0x08C9A144` | M (box 1 slot 1) | `0x08C9E134` | C | RAM §1: NTR L565; Gen6CTRPF PKHeX.cpp L449; maintainer measurement. Boxes beyond box 1 slot 1 unverified |
+| `mystatus` | PKHeX MyStatus6: TID u16 +0, SID u16 +2, game version u8 +4, language u8 +0x2D, OT name UTF-16LE 0x1A bytes +0x48 | `0x70` | `0x08C7D350` | D | `0x08C81340` | C | RAM §1, §3: NTR L252-254, L279-281, L425, L225-227; PokeReader L90; offsets inside the block from PKHeX MyStatus6.cs L29-33, L100, L104 |
+| `misc` | PKHeX Misc6AO: money u32 +8, badges u8 bitfield +0xC (bit i = badge i+1) | `0x10` | `0x08C6DDC8` | M (money `0x08C6DDD0`, badges `0x08C6DDD4` measured by cheat DB and Citra-Tracker) | `0x08C71DB8` | C | RAM §1: NTR L308; cheat DB L374 vs L434; Citra-Tracker `util/bagfuncs.py` L10, `citra-updater.py` L809; Gen6CTRPF PKHeX.cpp L1354/L1980 |
+| `play_time` | u16 hours, u8 minutes, u8 seconds | 4 | `0x08CF7D98` | D | `0x08CFBD88` | C | RAM §1: NTR L452; Gen6CTRPF Codes.cpp L6445. Lies inside the range of party slot 6 (+0x1A8), odd but used by two tools |
+| `map_id` | u16 zone id (PKHeX location space), u16 facing direction at +2 | 4 | `0x08C6A894` | D | `0x08C6E884` | C | RAM §1: Gen6CTRPF Codes.cpp L4150-4158 ("HW-confirmed: Mauville=278, Slateport=265, Petalburg=259, Granite=78"), L6557 |
+| `player_x` | f32 | 4 | `0x08C6A8A4` | D | `0x08C6E894` | C | RAM §1: Gen6CTRPF L4155, L6526 |
+| `player_y` | f32 (height Z at +0x08C6E898 is only inferred, unused) | 4 | `0x08C6A8AC` | D | `0x08C6E89C` | C | RAM §1: Gen6CTRPF L4156, L6527 |
+| `event_flags` | flag n = bit (n & 7) of byte n >> 3, 0xD00 flags | `0x1A0` | `0x08C7DDDC` | D | `0x08C81DCC` | C | RAM §4: Gen6CTRPF PKHeX.cpp L2608-2617 ("CONFIRMED via hardware RAM dump"). Flag numbers: PKHeX `flags_oras_en.txt` |
+| `battle_flag` | u32 == `0x00040001` while in battle | 4 | - (open) | - | `0x081FB478` | C | RAM §1: Gen6CTRPF Helpers.cpp L84-94 |
+| `battle_wild_foes` | wild opponent party, 5 horde slots, same slot layout as `party` | `0xB58` | `0x08805638` | U | `0x081FFA6C` | C | RAM §6 (v1.0, Citra-Tracker-v2 `citra-updater.py` L798-809, L836-844, L1715-1730; address computed from its arithmetic, not measured by us); RAM §1, §5 (v1.4, PokeReader reader.rs L77, L195-198, oras_frame.rs L62; CitraRNG L11) |
+| `battle_trainer_foes` | trainer opponent party (6 slots) | `0xB58` | `0x08804AF4` | U | - (open) | - | RAM §6 (Citra-Tracker-v2). The "+0x3FF0" guess `0x08808AE4` is unproven and not used |
+| `battle_wild_mons` | battle-mon array, stride `0x244`, 8 entries read: +0x0C species u16, +0x0E max HP u16, +0x10 HP u16, +0x18 level u8; own mons first, then foes | `0x1220` | `0x082041F4` | U | - (open) | - | RAM §6: Citra-Tracker "pp" anchor `0x0820430C` minus `0x118`; layout consistent with the v1.4 pointer-table struct (RAM §1, Gen6CTRPF Codes.cpp L631-650, L6482-6495) |
+| `battle_trainer_mons` | same for trainer battles | `0x1220` | `0x08205D04` | U | - (open) | - | RAM §6: anchor `0x08205E1C` minus `0x118` |
+
+Known but not used: own party copies in battle (`0x08804A94` wild, `0x08803F50` trainer, v1.0, RAM §6), current opponent species u16 `0x08432D80`, v1.4 battle pointer tables `0x081FB58C` / `0x081FB92C`, enemy lead `0x081FEEC8` (conflicts with PokeReader), Battle Points (Misc +0x30), repel steps, DexNav counters, daycare. Nothing was found for: live party count (the adapter counts slots with valid species, as Gen6CTRPF `CountParty` does), Situation block, encounter type (grass/surf/fishing), horde flag, whiteout flag, any v1.0 in-battle flag (RAM §8).
+
+The watches follow the table: both revisions are watched until the party is found, then the other revision's keys are unwatched. The largest ranges are `box` (215,760 bytes) and the foe/party buffers (2,904 bytes); the total stays far below the platform limits (4 MiB per range, 16 MiB total, 256 ranges; FrameBeam `docs/guides/plugin-api.md`).
+
+## Address overrides (no release needed)
+
+Any address can be corrected by writing lines `key=0xADDR` into the plugin cache file `config/addresses.txt` (hex, `0x` optional, nonzero, at most 8 digits; `#` starts a comment). A line `v1.0.key=0xADDR` applies only to that revision and wins over the plain `key=` line, which applies to both revisions and wins over the built-in table. Keys: `party`, `box`, `mystatus`, `misc`, `play_time`, `map_id`, `player_x`, `player_y`, `event_flags`, `battle_flag`, `battle_wild_foes`, `battle_trainer_foes`, `battle_wild_mons`, `battle_trainer_mons` (offsets inside a block are fixed, see the table, so correct the block start). Unknown keys, unknown revisions and unparseable values are ignored and logged as warnings. The file is read once at attach (reload the plugin). The older file `config/zone_addr.txt` (one address) is kept and equals `map_id=` for all revisions; it wins over `map_id=` in `addresses.txt`. A key without address (battle on v1.4 trainer, in-battle flag on v1.0) can be filled the same way.
 
 ## PK6 format
 
 Source: PKHeX `PKHeX.Core/PKM/PK6.cs` and `PokeCrypto.cs` (kwsch/PKHeX); cross-check Project Pokemon save structure documentation.
 
-- Crypto: seed = first u32 (encryption constant). `seed = seed * 0x41C64E6D + 0x6073` (32 bit), each u16 is xored with `seed >> 16`. Bytes `0x08..0xE7` are crypted; the party extension `0xE8..0x103` is crypted with a fresh stream seeded by the same constant (not a continuation of the first stream). The 4 blocks of 56 bytes are shuffled by `(EC >> 13) & 31` taken modulo 24 (table in PKHeX `BlockPosition`). Checksum at `0x06` = u16 sum of all u16 in `0x08..0xE7`. The host helper `fb.codec.pk6_decrypt` does this; `tests/support/pk6_crypto.lua` re-implements it for tests only.
-- Offsets used (decrypted): `0x00` EC u32, `0x06` checksum, `0x08` species u16, `0x0A` held item, `0x0C` TID, `0x0E` SID, `0x10` EXP u32, `0x14` ability, `0x18` PID u32, `0x1C` nature, `0x1D` bit0 fateful / bits1-2 gender / bits3-7 form, `0x1E`-`0x23` EVs, `0x40` nickname (UTF-16LE, 12 chars), `0x5A` moves 4 x u16, `0x74` IV32 (5 bits each hp/atk/def/spe/spa/spd, bit 30 egg, bit 31 nicknamed), `0xB0` OT name (UTF-16LE), `0xDF` origin game, `0xE3` language. Party extension: `0xE8` status u32, `0xEC` level, `0xF0` HP, `0xF2` max HP, `0xF4..` stats. All as in PKHeX PK6.cs; not independently verified on a device except species/EXP/checksum.
+- Crypto: seed = first u32 (encryption constant). `seed = seed * 0x41C64E6D + 0x6073` (32 bit), each u16 is xored with `seed >> 16`. Bytes `0x08..0xE7` are crypted; the party extension `0xE8..0x103` is crypted with a fresh stream seeded by the same constant (not a continuation of the first stream; PKHeX PokeCrypto L216-217). The 4 blocks of 56 bytes are shuffled by `(EC >> 13) & 31` taken modulo 24 (table in PKHeX `BlockPosition`). Checksum at `0x06` = u16 sum of all u16 in `0x08..0xE7`. The host helper `fb.codec.pk6_decrypt` does this; `tests/support/pk6_crypto.lua` re-implements it for tests only.
+- Offsets used (decrypted): `0x00` EC u32, `0x06` checksum, `0x08` species u16, `0x0A` held item, `0x0C` TID, `0x0E` SID, `0x10` EXP u32, `0x14` ability, `0x18` PID u32, `0x1C` nature, `0x1D` bit0 fateful / bits1-2 gender / bits3-7 form, `0x1E`-`0x23` EVs, `0x40` nickname (UTF-16LE, 12 chars), `0x5A` moves 4 x u16, `0x74` IV32 (5 bits each hp/atk/def/spe/spa/spd, bit 30 egg, bit 31 nicknamed), `0xB0` OT name (UTF-16LE), `0xDF` origin game, `0xE3` language. Party extension: `0xE8` status u32, `0xEC` level u8, `0xF0` HP, `0xF2` max HP, `0xF4..0xFC` Atk, Def, Spe, SpA, SpD (PKHeX PK6.cs L375-386). Only species/EXP/checksum are verified on a device.
 - Shiny: `(TID ^ SID ^ (PID >> 16) ^ (PID & 0xFFFF)) < 16`.
-- Language byte (PKHeX LanguageID): 1 ja, 2 en, 3 fr, 4 it, 5 de, 6 es, 8 ko, 9 zh-Hans, 10 zh-Hant.
-- The party extension of the live party is not trusted (level byte observed as garbage in Rev 2 EUR). It is parsed into `party_ext` only; `level`, `hp`, `max_hp`, `status` stay nil.
+- Language byte (PKHeX LanguageID): 1 ja, 2 en, 3 fr, 4 it, 5 de, 6 es, 8 ko, 9 zh-Hans, 10 zh-Hant (id 7 and unknown ids give `language = nil`).
+- Origin game byte `0xDF` (PKHeX GameVersion): X 24, Y 25, AS 26, OR 27 (recalled, not re-fetched). Note: RAM §1 writes "OR=26, AS=27" for the MyStatus game byte, which contradicts PKHeX; the adapter passes the raw byte through as `trainer().version` and does not interpret it. Open.
+
+### Live party stats (RAM §2)
+
+Live level/HP are not in the first `0xE8` bytes. Per party slot (stride `0x1E4`) the game keeps the 22 bytes `0xE8..0xFD` of the PK6 party format at slot +0x158, encrypted with a **fresh stream seeded with the EC** (Citra-Tracker `citra-updater.py` L2427-2431 and PokeStreamer-Tools L201-204 both decrypt it this way). The adapter reads `0xE8` bytes at +0 and 22 bytes at +0x158, builds a 260-byte buffer (`0xE8` bytes + 22 bytes + 6 zero bytes) and calls `fb.codec.pk6_decrypt` (the stat stream starts at the buffer's first u32, the EC). Taken: status u32 `0xE8`, level `0xEC`, HP `0xF0`, max HP `0xF2`. Sanity check (otherwise all four stay nil and `level` falls back to the level from EXP): level 1..100, max HP 1..1500, HP <= max HP, and Atk/Def/Spe/SpA/SpD each 1..1500. The stat check goes beyond the brief: an all-zero or stale stats area decrypts to garbage that passed the level/HP checks in 20 % of 3000 random trials (measured with the synthetic crypto), the added stat check passed in none of them. The brief's old observation "level byte `0xEC` is garbage at the Rev 2 party address" is explained by reading the stats from slot +0xE8 instead of +0x158; the new layout is from the research and **not yet verified on a device**. Party count = slots with valid species.
 
 ## Level from EXP
 
-Level = highest n with `exp_for_level(rate, n) <= exp`, formulas in `src/gen6/growth.lua` (Bulbapedia "Experience"). Growth rate IDs (PKHeX PersonalInfo.EXPGrowth): 0 medium fast, 1 erratic, 2 fluctuating, 3 medium slow, 4 fast, 5 slow.
+Fallback when no live stats pass the check. Level = highest n with `exp_for_level(rate, n) <= exp`, formulas in `src/gen6/growth.lua` (Bulbapedia "Experience"). Growth rate IDs (PKHeX PersonalInfo.EXPGrowth): 0 medium fast, 1 erratic, 2 fluctuating, 3 medium slow, 4 fast, 5 slow.
 
-Growth rate per species is read at runtime from the user's own RomFS via `fb.rom.romfs` + `fb.codec.garc`/`garc_file` (`src/gen6/personal.lua`), cached in a Lua table only. Values to verify locally against a real RomFS (the tests use synthetic stubs):
+## Personal table (`species_info`, growth)
 
-- Path: candidates `/a/1/9/5` and `/a/1/9/6` (recollections differ, neither verified). Both are tried in order at runtime and the first that validates as a personal table is used; the accepted path is logged once at info level. To verify locally.
-- Validation: either one file with length divisible by `0x50` and at least 722 entries, or at least 722 files of `0x50` bytes; the growth byte of entries 1..721 must always be 0..5. If neither path validates, no growth rate is returned.
-- Entry size `0x50` (PKHeX PersonalInfoORAS). To verify locally.
-- Growth byte at entry offset `0x15` (PKHeX PersonalInfoORAS.EXPGrowth). To verify locally.
-- Species index = National Dex number; form-specific personal entries are not used (growth is per species).
+`src/gen6/personal.lua`. Path `/a/1/9/5` is confirmed for ORAS (ROMFS §1, §4: pk3DS GARCReference.cs:47, GameConfig.cs:118-122); `/a/1/9/6` stays as a fallback candidate. The **last GARC file holds the whole table concatenated**, entry size `0x50` (PersonalInfoORAS.cs:7). The reader validates the last file (length divisible by `0x50`, at least 722 entries, growth byte of entries 1..721 in 0..5); per-entry file layouts (>= 722 files) are still accepted. The accepted path is logged once at info level. Entry offsets (PersonalInfoXY.cs, ROMFS §4): `0x06` Type1, `0x07` Type2 (u8, same value = single type), `0x15` EXP growth, `0x1C` u16 FormStatsIndex, `0x20` u8 FormeCount. Index of a form: species for form 0, else `FormStatsIndex + form - 1` when `0 < form < FormeCount` (PersonalTable.GetFormIndex). `species_info(species, form)` returns `{ types = { t1, t2 }, growth }`; type ids index the game text `type` list. Nothing is persisted.
 
-If RomFS is unreadable (encrypted game, wrong path) `level` stays nil.
+## Game text (names)
 
-## Location (zone id)
+`src/gen6/text.lua`. Source: ROMFS §1, §2 (pk3DS `TextFile.cs`, `GARCReference.cs`, `GameConfig.cs`, `TextReference.cs`).
 
-`src/gen6/oras_location.lua`. `location()` returns `{ zone = <u16>, source = "memory" }`. The RAM address of the current zone id is **not known yet** (to find with a local probe). `ZONE_ADDR` (keyed by revision name `rev2` / `rev0_1`) is empty ("fill from local probe"). Until then an address can be given without a release: write it in hex (`0x08C12345`) into the plugin cache file `config/zone_addr.txt`; it applies to any revision, wins over `ZONE_ADDR`, is read once at attach (reload the plugin) and is watched as 2 bytes. `features.location` is true only when an address is configured; without one `location()` returns `nil, "unsupported"`, with an unreadable address `nil, "not_ready"`. The u16 width is an assumption (zone ids are u16 in the Gen 6 zone/world data; the live variable's width is unverified).
+- Archive: gametext GARC `/a/0/7/1 + language index` (ORAS): 0 JA kana `/a/0/7/1`, 1 JA kanji `/a/0/7/2`, 2 EN `/a/0/7/3`, 3 FR `/a/0/7/4`, 4 IT `/a/0/7/5`, 5 DE `/a/0/7/6`, 6 ES `/a/0/7/7`, 7 KO `/a/0/7/8`. The same file indices are valid in every language archive. The language comes from the MyStatus language byte (`ja` tries index 1 then 0; `zh-*` have no archive and use EN); fallback EN, then the first readable archive (an archive counts as readable with at least 115 entries and valid species and move text). All 8 language archives are present on every cartridge region (Project Pokemon file list, F).
+- Files (GARC entry = file index + 1): species 98 (line = National Dex number), moves 14, types 18, abilities 37, natures 51, location names 90 (line = location name index, `ParentMap` of ZoneData), items 114, forms 5.
+- File format (little endian): `0x00` u16 sections (1), `0x02` u16 line count, `0x04` u32 total length, `0x08` u32 initial key (0), `0x0C` u32 section data offset SDO (`0x10`); at SDO u32 section length (== total length; SDO + total == file length); line table at SDO+4, 8 bytes per line: i32 offset (relative to SDO), i16 length in UTF-16 units, 2 pad. Line i is decrypted word by word: `plain = word xor key`, `key = rotl16(key, 3)`, start key `(0x7C89 + i * 0x2983) & 0xFFFF`. Decoding: `0x0000` ends the line; `0x0010` = variable (next u16 count, next u16 code, count-1 args); code `0xBE00` becomes `\r`, `0xBE01` `\c`, `0xBE02` `[WAIT]`, `0xBDFF` (empty-line marker) nothing, any other code `[VAR xxxx]` (args skipped). Private glyphs `0xE07F` -> U+202F, `0xE08D` -> U+2026, `0xE08E` -> U+2642, `0xE08F` -> U+2640; UTF-16 surrogate pairs are combined.
+- Loading: one archive read, then one file per step (8 steps), then the archive string is dropped; only the 8 parsed files are kept and lines are decoded on demand and cached in memory. Nothing is written to `fb.cache`. Names are never shipped.
+- The location list of the game text has the layout of the name index of ZoneData (`ParentMap`). PKHeX's derived list shows names at even and sub-names at odd indices; we use the game text line directly and have not checked how many odd lines hold text.
+
+## Zones and encounter areas
+
+`src/gen6/zones.lua`. Source: ROMFS §3 (pk3DS `RSWE.cs`, `OWSE.cs`, `OWSEStructs.cs`, `mini.cs`, `GARC.cs`).
+
+- Archive `/a/0/1/3` (encdata). Entries are classified by content: first byte `0x11` = LZ11, decompressed with `fb.codec.lz_decompress`; magic `ZO` = zone pack; magic `EN` = encounter copy pack (ORAS, ignored); no magic and size divisible by `0x38` = the zonedata table. Index positions are not relied upon (ROMFS §3 recommendation).
+- Mini pack: 2-byte magic, u16 count, (count + 1) u32 offsets from the file start. ZO sub-files: [0] ZoneData (`0x38`, same layout as the table), [1] entities/scripts, [2] map script, [3] wild encounters, [4] ORAS only unknown.
+- ZoneData `0x38`: u16 at `0x1C`, low 10 bits = location name index (ParentMap, gametext 90); the table record `z` belongs to zone `z`.
+- Zone id: GARC index (0-based) of the ZO entry (ROMFS §3: "zone number == GARC index", index order itself is only inferred). After the scan the adapter compares the ZO sub-file 0 copies with the table records for both numberings (GARC index vs ordinal among ZO packs) and uses the one that matches better; the winner is logged (`zone ids by garc index|ordinal`).
+- Encounters (ORAS): start = ZO offset[3] + `0x0E`; no table when `offset[4] - start < 0xF6` or the ZO has fewer than 4 sub-files. 61 slots x 4 bytes (`0xF4`): u16 species (bits 0-10) / form (bits 11-15), u8 min level, u8 max level; species 0 = empty. Slot order: grass 12, tall grass 12, swarm 3, surf 5, rock smash 5, old rod 3, good rod 3, super rod 3, horde A 5, horde B 5, horde C 5. The three horde groups are merged into `horde`. Slots with species above 721 are ignored. Rates (not used): grass 10x9/5/4/1 %, surf and rock smash 50/30/15/4/1, rods 60/35/5, horde A 60, B 35, C 5 %.
+- `areas()`: zones with at least one valid slot, grouped by location name id, areas in order of their first zone, `zones` = zone ids with encounters, identical `{species, form, min, max}` entries removed. Route vs town has no flag; a town is simply a zone without encounters (`zone_info` still works). DexNav-only, static and gift encounters are not in this table. The kind of an encounter (grass vs surf in the live game) is **not** detectable from RAM (RAM §5, §8); consumers combine `areas()` with the manual correction.
+- Scanning: 8 entries per step; the zone count of ORAS is 535 (ROMFS §3), roughly 70 steps, about 10 s at the default tick rate. Only derived numbers are kept in memory (no cache file, no names).
+
+## Location
+
+`location()`: zone id = u16 at `map_id` (RAM §1, hardware-confirmed on v1.4: Mauville 278, Slateport 265, Petalburg 259, Granite 78); `x`, `y` = f32 at `player_x` / `player_y`; `location` / `name` from `zone_info` once the zone scan and game text are loaded. The u16 width is as documented by the same source. `zone_addr.txt` / `addresses.txt` can correct the address. The v1.0 addresses are derived (D) and not measured.
+
+## Trainer, badges, money, play time
+
+`trainer()`: name, TID, SID, game byte, language from `mystatus`; money u32 from `misc + 8` (dropped when above 999,999); `badges` = popcount of the u8 at `misc + 0xC`; play time from `play_time` (dropped when minutes or seconds are 60 or more). `badges()` returns `count` and `flags[1..8]` (flag i = bit i-1). `language()` = MyStatus language byte as code; when MyStatus is unreadable the old heuristic applies (language of the largest own-origin OT group in the party).
+
+## Battle and encounters
+
+`src/gen6/oras_battle.lua`. Sources: RAM §5, §6; Gen6CTRPF Codes.cpp L5728-5741 ("struct fills a frame or two after the in-battle flag rises"; wild PK6 has an empty OT name); Citra-Tracker (v1.0 wild/trainer detection: opponent buffer slot 0 decrypts to species 1..807 and the pp byte is below 65).
+
+The opponent party buffers and the battle-mon arrays **persist after a battle**, so "in battle" is inferred:
+
+- **Start**: slot 1 of an opponent buffer (`battle_wild_foes` or `battle_trainer_foes`; the raw first `0xE8` bytes are compared every tick, the first reading is the baseline) changes and decrypts to a valid checksummed PK6 (species 1..721), and within 150 polls the battle-mon array of that kind holds a plausible entry (species 1..721, max HP >= 1, HP <= max HP, level 1..100) matching the foe by species and level, and where the in-battle flag is known (v1.4) it reads `0x00040001`. Without a battle-mon array address (v1.4 today) the flag alone confirms. Wild vs trainer = which buffer changed.
+- **Foes**: the valid buffer slots that match an unused battle-mon entry (scanned from the end of the array; own mons come first); HP, max HP and level come from the battle-mon entry. Without an array the wild slot 1 and, for a horde, slots 2..5 are used. **Horde** = foe slots 2..5 all valid (and matched). Stale slots of an older battle in the same buffer are ignored when an array exists.
+- **Own** (`battle().own`): the remaining battle-mon entries matched to party members by species and level; `personality` and `slot` from the live party, `hp`/`max_hp` from the battle-mon entry, so a faint in battle (HP 0) is visible while the party stats are still stale.
+- **End**: the in-battle flag drops, or the zone (`map_id`) changes, or the overworld position changes by more than 0.01, or no battle-mon entry matches any foe for 3 polls in a row (array cleared). A battle that ends without the player moving (flee, catch, faint) is therefore detected late, when the array is cleared or the player moves.
+- **Encounters**: each wild battle start appends `{ seq, species, form, level, shiny, horde, zone, location, frame }` (frame from `fb.memory.frame()`), last 64 kept; trainer battles add none.
+- Events: `battle.started`, `encounter` (wild only), `battle.ended`.
+
+**Unverified for the real game (Fabio must check):** all v1.0 battle addresses (`battle_wild_foes`, `battle_trainer_foes`, `battle_wild_mons`, `battle_trainer_mons`; arithmetic of the Citra-Tracker constants), the battle-mon field offsets on v1.0, that the opponent buffer slot layout has the party stats at +0x158 (assumed from `party`), whether the buffers really change at battle start and stay valid, the stride/count of the battle-mon array in doubles and hordes (8 entries read), and the end conditions. There is no v1.0 in-battle flag. The v1.4 trainer buffer and battle-mon arrays are open. Any of them can be replaced through `config/addresses.txt`.
 
 ## Icons
 
-`src/gen6/icons.lua`. `icon(species, form)` returns the PNG of the box icon (`fb.codec.bclim` + `fb.codec.png`). No path is hardcoded. Assumptions to verify locally:
+`src/gen6/icons.lua`. `icon(species, form)` returns the PNG of the box icon (`fb.codec.bclim` + `fb.codec.png`). The research lists `/a/0/9/1` ("971 box sprites", F) but the discovery stays content based. Assumptions to verify locally:
 
-- Discovery: `fb.rom.romfs_list` walked recursively from `/a`, one directory or one candidate per step. Candidates are files of 256 KiB to 16 MiB (thresholds are assumptions). A candidate is accepted when `fb.codec.garc` reports 700 to 1100 entries and the entries of species 1, 25, 150, 300, 500, 700 (GARC entry species + 1, sub-file 1) decode as BCLIM with a size in {40x30, 32x32, 64x32}. Wrong size set or entry range makes discovery fail (`icon` then returns `nil, "unsupported"`; the log says "no box icon archive found"). A path can be forced by writing it into the cache file `config/icon_garc.txt` (it is still validated).
-- Mapping: base species i at GARC entry i + 1 (1-based; entry 0 is assumed a dummy). Form f > 0 uses the personal-table form index: entry = `FormStatsIndex + f - 1` where `FormStatsIndex` is the u16 at personal entry offset `0x1C` and `FormeCount` the byte at `0x20` (PKHeX PersonalInfoXY/ORAS; recalled, unverified), valid for `0 < f < FormeCount`. This assumes the icon archive is indexed like the personal table (forms after the base list). Otherwise, or when the personal table is unreadable, the base icon is returned and not cached under the form key.
-- Cache: `icons/<species>-<form>.png`, index `icons/index.txt` (path of the archive, validated again on the next start). `features.icons` becomes true when the archive is found; discovery starts after 90 ticks.
-- The decoded BCLIM is whatever `fb.codec.bclim` returns (size 40x30 expected); the PNG keeps that size.
+- Discovery: `fb.rom.romfs_list` walked recursively from `/a`, one directory or one candidate per step. Candidates are files of 256 KiB to 16 MiB. A candidate is accepted when `fb.codec.garc` reports 700 to 1100 entries and the entries of species 1, 25, 150, 300, 500, 700 (GARC entry species + 1, sub-file 1) decode as BCLIM with a size in {40x30, 32x32, 64x32}. A path can be forced by writing it into the cache file `config/icon_garc.txt` (it is still validated).
+- Mapping: base species i at GARC entry i + 1; form f > 0 uses the personal-table form index (see Personal table), valid for `0 < f < FormeCount`.
+- Cache: `icons/<species>-<form>.png`, index `icons/index.txt`. `features.icons` becomes true when the archive is found; discovery starts after 90 ticks.
 
 ## Region map
 
-`src/gen6/maps.lua`, `src/gen6/darc.lua`. The real map image is read from the user's game, none is drawn.
+`src/gen6/maps.lua`, `src/gen6/darc.lua`. The real map image is read from the user's game, none is drawn. Region map image: **not found** in the research (ROMFS §7); candidates from the Project Pokemon list (F): `a/0/6/7`, `a/0/6/8` (town map UI), `a/2/4/8` (PokeNav location screens, `a/2/4/7` header), `a/2/7/6` (map navi buttons).
 
-- Scan: all RomFS files from `/a` (files larger than 32 MiB or smaller than 64 bytes are skipped). One file is read per step. In each file: if `fb.codec.garc` parses it, every entry (sub-file 1, at most 5000 per file, 16 per step) is examined, otherwise the file itself is entry 1. An entry is checked as plain BCLIM (footer `CLIM` + `imag`), as LZ10/LZ11 data (first byte 0x10/0x11, compressed size up to 2 MiB, decompressed up to 4 MiB, then re-checked once) and as DARC (magic `darc`, files checked as BCLIM regardless of name).
-- Threshold: decoded size at least 256 px wide and 128 px high. The size is read from the `imag` header (equals the decoded size); candidates are not decoded during the scan. Up to 2000 candidates are stored, `map_candidates()` returns the 40 largest by area.
+- Scan: those four archives are read **first**, then every other RomFS file from `/a` in path order (files larger than 32 MiB or smaller than 64 bytes are skipped). One file is read per step. In each file: if `fb.codec.garc` parses it, every entry (sub-file 1, at most 5000 per file, 16 per step) is examined, otherwise the file itself is entry 1. An entry is checked as plain BCLIM (footer `CLIM` + `imag`), as LZ10/LZ11 data (first byte 0x10/0x11, compressed size up to 2 MiB, decompressed up to 4 MiB, then re-checked once) and as DARC (magic `darc`, files checked as BCLIM regardless of name).
+- Threshold: size at least 256 px wide and 128 px high (from the `imag` header). Every candidate is decoded once with `fb.codec.bclim` and **dropped when mostly noise**: of up to 64 x 128 sampled horizontal neighbour pixel pairs (pairs with both pixels fully transparent skipped, at least 200 pairs needed) more than 50 % differ by more than 96 (sum of the RGB differences, maximum 765). A garbage decode of a wrong candidate differs at nearly every pixel; real maps and UI textures have large smooth areas. A candidate that cannot be decoded is kept. Up to 2000 candidates are stored, `map_candidates()` returns the 40 largest by area. The thresholds (96, 50 %) are guesses to tune against the real game.
 - id = `<romfs path>#<garc entry, 1-based>[/<darc file path>]`, a loose BCLIM file uses entry 1.
-- DARC layout (3dbrew, recalled, unverified on real files): header `darc`, BOM, header size, version, file size, table offset, table length, data offset; 12-byte table entries (name offset with flag byte 1 = directory; directories hold parent and end index, files hold data offset and length); names UTF-16LE behind the table. Only ASCII names are kept, other characters become `?`; directory depth up to 16.
-- Cache: `map/index.txt` (`complete`/`partial` + `id`, width, height), `map/files.txt`, `map/progress.txt` (files finished; saved every 10 files, resumable), PNGs `map/<hash>.png` (djb2 of the id). A PNG above 1 MiB gives `nil, "too_large"`. `features.map` is true when the scan finished with at least one candidate; map scan starts after 120 ticks.
-- `map_selected()` reads `MAP_ID` in `maps.lua` (empty: "fill after Fabio confirms"), keyed by game id (`pokemon_omega_ruby`), optionally a table per revision name.
-- Open: whether the region map is a BCLIM at all (it may be in another format such as a texture inside a model archive, which this scan does not find), its real size, and whether it is LZ-wrapped or in a DARC. Several candidates will show up; the maintainer chooses with `map_candidates()`/`map_image()`.
+- DARC layout (3dbrew, recalled, unverified on real files): header `darc`, BOM, header size, version, file size, table offset, table length, data offset; 12-byte table entries (name offset with flag byte 1 = directory; directories hold parent and end index, files hold data offset and length); names UTF-16LE behind the table. Only ASCII names are kept; directory depth up to 16.
+- Cache: `map/index.txt` (`complete`/`partial` + `id`, width, height), `map/files.txt`, `map/progress.txt` (files finished; saved every 10 files, resumable), PNGs `map/<hash>.png`. A PNG above 1 MiB gives `nil, "too_large"`. `features.map` is true when the scan finished with at least one candidate; the scan starts after 120 ticks. Caches written by v0.2 (sorted file order, no noise filter) keep their index; delete `map/` in the plugin cache to rescan.
+- `map_selected()` reads `MAP_ID` in `maps.lua` (empty: "fill after Fabio confirms"), keyed by game id, optionally a table per revision name (`v1.0` / `v1.4`).
+- Open: whether the region map is a BCLIM at all, its real size, and whether it is LZ-wrapped or in a DARC. Several candidates will show up; the maintainer chooses with `map_candidates()`/`map_image()`.
 
 ## Open points
 
-- Zone id RAM address (see Location), icon archive path and sizes, map image location (see above); all RomFS assumptions are verified only against synthetic data.
-
-- Party stride/order with 3 or more members, and maximum slots in live memory.
-- Where live level/HP/status are kept (the `0xEC` byte is unusable at the Rev 2 party address).
-- Language: no save-block offset is sourced (open). `language()` is a heuristic: party records whose origin game byte (`0xDF`) is Alpha Sapphire (26) or Omega Ruby (27) (PKHeX `GameVersion`: X 24, Y 25, AS 26, OR 27; recalled, not re-fetched) are grouped by OT ID/SID; the largest group (earliest slot on ties) is the player's own catches and its first member's language byte (`0xE3`) is returned, else nil. A Pokemon traded in from an OR/AS cartridge of another language can fool it, and it returns nil with only foreign-origin Pokemon in the party.
+- Everything marked D, U or `-` in the address table. Most important for Fabio on the real game (v1.0): `mystatus` (`0x08C7D350`, expected TID/SID/language/OT name), `map_id` (`0x08C6A894`) with player X/Y, play time, the live stats layout at party slot +0x158, and all four battle addresses.
+- Zone ids: GARC index vs ordinal numbering (logged after the scan; check that a known zone, e.g. Mauville 278, reports the right location name), index of the zonedata table.
+- The location name list: odd/even line layout in the game text (PKHeX shows sub-names at odd indices).
+- JA language choice (kanji index 1 before kana 0) and the Chinese codes (no text archive, EN is used).
+- MyStatus game byte meaning (OR/AS numbers contradict between the research and PKHeX).
+- Party stride/order with 3 or more members, and maximum slots in live memory (stride `0x1E4` is documented by several tools).
 - Boxes beyond box 1 slot 1: contiguity and stride in live memory unverified.
-- Battle, encounters, badges: no offsets.
-- Alpha Sapphire, other regions/languages, Rev 0/1 (community addresses only), update-patch variants.
-- Personal GARC path, shape and offsets (see above).
+- Alpha Sapphire, other regions/languages and title IDs, update-patch variants other than v1.0/v1.4.
+- Icon archive path and sizes, map image location (see above); all RomFS assumptions are verified only against synthetic data.
+- Encounter type (grass/surf/fishing/rock smash) and a horde flag are not available from RAM (RAM §8).

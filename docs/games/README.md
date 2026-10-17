@@ -1,6 +1,6 @@
 # Games
 
-Per-game adapter documentation. Adapter status: **v0.1 adapter** = `team`/`box` readable; **detected** = recognized by the game table (`src/core/games.lua`), no adapter yet; **open** = identification not yet designed.
+Per-game adapter documentation. Adapter status: **adapter** = memory adapter present (version in the table); **detected** = recognized by the game table (`src/core/games.lua`), no adapter yet; **open** = identification not yet designed.
 
 | Gen | Game | System | Detection code | Adapter |
 |---|---|---|---|---|
@@ -22,8 +22,8 @@ Per-game adapter documentation. Adapter status: **v0.1 adapter** = `team`/`box` 
 | 5 | White 2 | NDS | `IRD` | detected, no adapter |
 | 6 | X | 3DS | `0004000000055D00` | detected, no adapter |
 | 6 | Y | 3DS | `0004000000055E00` | detected, no adapter |
-| 6 | Omega Ruby | 3DS | `000400000011C400` | v0.1 adapter ([doc](omega-ruby-alpha-sapphire.md)) |
-| 6 | Alpha Sapphire | 3DS | `000400000011C500` | v0.1 adapter, untested on device ([doc](omega-ruby-alpha-sapphire.md)) |
+| 6 | Omega Ruby | 3DS | `000400000011C400` | v0.3 adapter ([doc](omega-ruby-alpha-sapphire.md)) |
+| 6 | Alpha Sapphire | 3DS | `000400000011C500` | v0.3 adapter, untested on device ([doc](omega-ruby-alpha-sapphire.md)) |
 | 7 | Sun | 3DS | `0004000000164800` | detected, no adapter |
 | 7 | Moon | 3DS | `0004000000175E00` | detected, no adapter |
 | 7 | Ultra Sun | 3DS | `00040000001B5000` | detected, no adapter |

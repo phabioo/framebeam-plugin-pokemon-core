@@ -21,26 +21,36 @@ The FrameBeam sandbox has no `require`, `load`, `dofile`, `io` or `os` and loads
 
 ## Interface `pokemon.core`
 
-`core.interface.new(entry, detected, adapter)` builds the table for `fb.provide("pokemon.core", tbl)`.
+`core.interface.new(entry, detected, adapter)` builds the table for `fb.provide("pokemon.core", tbl)`. Convention for every method: a value, or `nil, "unsupported" | "not_ready" | <reason>`. All ids are the game's internal ids; names come from the user's own game text (current game language), never from tables. Contract version: v0.3 (shared with the SoulLink plugin).
 
-- `info()` returns `{ game_id, name, gen, system, version, language, revision, supported, features = { team, box, location, battle, encounters, badges } }`. `features` says which methods the adapter has; `language` is `adapter:language()` if present, else the detected language.
-- `features` also has `icons` (icon archive found) and `map` (map scan finished with at least one candidate). An adapter can override feature flags that depend on runtime state through an optional `features()` method (location is true only with a configured address).
-- `icon(species, form)` returns a PNG string of the box icon, or `nil, "not_ready" | "unsupported" | "unknown_species"`. `form` defaults to 0. PNGs are cached in `fb.cache` (`icons/<species>-<form>.png`).
-- `location()` returns `{ zone = <u16>, source = "memory" }` (ORAS), `nil, "unsupported"` without a configured address, `nil, "not_ready"` while unreadable.
-- `map_candidates()` returns `{ {id, w, h}, ... }` (largest area first, at most 40) or `nil, "not_ready"` during the scan; `map_image(id)` returns the PNG (`nil, "not_ready" | "unknown_map" | "too_large"`, values stay below 1 MiB); `map_selected()` returns the confirmed map id of the game or `nil`.
-- `team()`, `box(n)`, `box_count()`, `location()`, `battle()`, `encounters()`, `badges()` delegate to the adapter method of the same name. Without adapter or method they return `nil, "unsupported"`; an adapter may return `nil, "not_ready"`, which is passed through.
+- `info()` returns `{ game_id, name, gen, system, version, language, revision, supported, features }`. `revision` is the game update (`"v1.0"` or `"v1.4"` for ORAS), not the region. `language` is `adapter:language()` (ORAS: MyStatus language byte as code `de en fr it es ja ko zh-Hans zh-Hant`) else the detected language. `features` has `team box location battle encounters badges trainer names areas live_stats icons map`: method-backed ones (`team`, `box`, `trainer`, ...) are true when the adapter has the method; an adapter refines the state-dependent ones through its optional `features()` (`icons` archive found, `map` scan finished, `names` game text loaded, `areas` zone scan found areas, `live_stats` live level/HP seen on a team member, `location`/`battle`/`encounters` address known).
+- `team()`, `box(n)`, `box_count()`, `battle()`, `encounters()`, `badges()`, `trainer()`, `name(kind, id)`, `species_info(species, form)`, `areas()`, `zone_info(zone)`, `icon(species, form)`, `map_candidates()`, `map_image(id)`, `map_selected()` delegate to the adapter method of the same name. Without adapter or method they return `nil, "unsupported"`; an adapter may return `nil, "not_ready"`, which is passed through.
+- `team()` records: the generic record below plus live `level`, `hp`, `max_hp`, `status` (u32) from the live party stats (nil when the stats do not pass the sanity check; `level` then comes from EXP and the personal table) and `species_name` (nil until the game text is loaded). `slot` is the 1-based party position, only valid party members are listed.
+- `location()` returns `{ zone = <u16 map/zone id>, location = <location name id or nil>, name = <string or nil>, x = <float?>, y = <float?>, source = "memory" }`; `nil, "unsupported"` when the revision has no map-id address, `nil, "not_ready"` while the address is unreadable.
+- `badges()` returns `{ count = n, flags = { 8 booleans, index i = badge i } }`.
+- `trainer()` returns `{ name, tid, sid, version, language, money, badges = n, play_time = { h, m, s } }` (money and play time are left out when implausible).
+- `name(kind, id)` returns the string, `nil` for an unknown id, or `nil, "not_ready"` while the game text loads (`nil, "unsupported"` when no text archive is readable). `kind`: `species move item ability nature type location form`.
+- `species_info(species, form)` returns `{ types = { t1, t2 }, growth }` (`t2 == t1` for a single type, type ids index `name("type", id)`), `nil, "not_ready"` while the personal table is unreadable, `"unknown_species"`, `"no_form"`.
+- `areas()` returns the encounter areas in game order (first zone of the area): `{ id = <location name id>, name, zones = { zone ids with encounters }, encounters = { grass, tall_grass, swarm, surf, rock_smash, old_rod, good_rod, super_rod, horde } }`; each list holds `{ species, form, min, max }` (identical entries removed, empty lists absent). Only locations with at least one encounter slot are areas. `zone_info(zone)` returns `{ zone, location, name }` for any zone (towns included), `nil, "unknown_zone"` otherwise.
+- `battle()` returns `{ active = bool, kind = "wild" | "trainer", horde = bool, foes = { { species, form, level, hp, max_hp, shiny, personality, species_name } }, own = { { personality, species, hp, max_hp, slot, species_name } } }`; `{ active = false }` outside a battle. `encounters()` returns the last 64 wild encounters since the plugin started, oldest first: `{ seq, species, form, level, shiny, horde, zone, location, frame, species_name }`, one entry per wild battle start (horde: the first foe). Consumers remember the last `seq`.
+- `icon(species, form)` returns a PNG string of the box icon, or `nil, "not_ready" | "unsupported" | "unknown_species"`; PNGs are cached in `fb.cache` (`icons/<species>-<form>.png`).
+- `map_candidates()` returns `{ {id, w, h}, ... }` (largest area first, at most 40) or `nil, "not_ready"` during the scan; `map_image(id)` returns the PNG (`nil, "not_ready" | "unknown_map" | "too_large"`, below 1 MiB); `map_selected()` returns the confirmed map id of the game or `nil`.
 
 Generic Pokémon record (adapters fill what they can, unknown fields are `nil`; all IDs are the game's internal IDs, names come from the game, never from tables):
 
-`{ species, form, nickname, level, exp, personality, shiny, gender, nature, ability, held_item, moves = {ids...}, ot_name, ot_id, ot_sid, language, egg, hp, max_hp, status, slot, box }`
+`{ species, species_name, form, nickname, level, exp, personality, shiny, gender, nature, ability, held_item, moves = {ids...}, ot_name, ot_id, ot_sid, language, egg, hp, max_hp, status, slot, box }`
+
+## Events
+
+Emitted through `fb.events.emit` (the source is this plugin's id): `game.detected` `{ game_id, gen, supported }` once; `team.changed` `{ team }` when the serialized team changed (checked every 15th tick); `battle.started` `{ kind, horde, foes = { species... } }`; `battle.ended` `{ kind }`; `encounter` (the new `encounters()` entry); `location.changed` (the `location()` table, emitted when zone, location id or name changed).
 
 ## Adapter contract
 
-An adapter module exports `attach(ctx)` with `ctx = { fb = fb, game = entry, detected = info }`. It registers its memory watches and returns an adapter object with any of `revision() language() team() box(n) box_count() location() battle() encounters() badges() icon(species, form) map_candidates() map_image(id) map_selected() features() tick()`, called with `:` (the adapter is `self`). Adapters read only through `ctx.fb`. `core.adapters` is a static registry keyed by module name; a missing module is skipped, so an entry without a usable adapter runs with `supported = false`.
+An adapter module exports `attach(ctx)` with `ctx = { fb = fb, game = entry, detected = info }`. It registers its memory watches and returns an adapter object with any of `revision() language() team() box(n) box_count() location() battle() encounters() badges() trainer() name(kind, id) species_info(species, form) areas() zone_info(zone) icon(species, form) map_candidates() map_image(id) map_selected() features() tick()`, called with `:` (the adapter is `self`). The adapter emits its own events (battle, encounter, location) through `ctx.fb.events`. Adapters read only through `ctx.fb`. `core.adapters` is a static registry keyed by module name; a missing module is skipped, so an entry without a usable adapter runs with `supported = false`.
 
-## Entry and events
+## Entry
 
-`main.lua`: unknown game logs `not_pokemon` and returns. Known game without adapter logs `no_adapter` and still provides the interface (`supported = false`). With an adapter: provide, emit `game.detected` `{ game_id, gen, supported }` once, every tick call the adapter's optional `tick()` (bounded background work such as icon/map discovery), then every 15th tick call `team()` and emit `team.changed` `{ team = list }` when its deterministic serialization (`core.serialize`) changed. All user-visible strings go through `fb.i18n.t` (`plugin/i18n/en.json` source, `de.json`).
+`main.lua`: unknown game logs `not_pokemon` and returns. Known game without adapter logs `no_adapter` and still provides the interface (`supported = false`). With an adapter: provide, emit `game.detected` once, every tick call the adapter's optional `tick()` (bounded background work and state tracking), then every 15th tick call `team()` and emit `team.changed` when its deterministic serialization (`core.serialize`) changed. All user-visible strings go through `fb.i18n.t` (`plugin/i18n/en.json` source, `de.json`); the v0.3 additions have no new UI strings (log lines are developer diagnostics in English).
 
 ## Adding a game
 
@@ -51,11 +61,12 @@ An adapter module exports `attach(ctx)` with `ctx = { fb = fb, game = entry, det
 
 ## Background discovery
 
-Icon and map discovery (`gen6.icons`, `gen6.maps`) are state machines advanced by `adapter:tick()` (and by `not_ready` calls). One step is one directory listing, one RomFS file read plus a bounded batch of GARC entries, or one candidate validation, so no entry call comes near the 500 ms / 20M instruction budget. Results are persisted in `fb.cache` (`icons/index.txt`, `map/index.txt`, `map/files.txt`, `map/progress.txt`) and later starts skip the work. Only derived data (paths, sizes, PNGs of the user's own game) is cached; nothing is shipped.
+Game text (`gen6.text`), zones (`gen6.zones`), icon (`gen6.icons`) and map (`gen6.maps`) discovery are state machines advanced by `adapter:tick()` on different tick phases (and by one step on a `not_ready` call). One step is one archive read, one directory listing, a bounded batch of GARC entries (8 zone entries, 16 map entries), one text file or one candidate validation, so no entry call comes near the 500 ms / 20M instruction budget. Game text is loaded when the game language is known (fallback EN after about 300 steps, reloaded once the real language is known), the archive is dropped after its files are extracted and decoded lines are cached in memory only. Zones are kept as derived numbers in memory. Only icon and map results are persisted in `fb.cache` (`icons/index.txt`, `map/index.txt`, `map/files.txt`, `map/progress.txt`, PNGs); game text and names are never written to the cache.
+
+State tracking in `tick()` (`gen6.oras`): revision detection (every 5th tick until found), `location.changed`, battle/encounter polling (`gen6.oras_battle`, every tick, reads only 232 bytes per opponent buffer until one changes) and the revision cross-check (every 30th tick until it had something to compare). All wrapped in `pcall`.
 
 ## Open
 
 - Gen 1/2: game identification on GB/GBC is open in FrameBeam; no entries yet.
-- 3DS language detection (done by the adapter at runtime, source open).
-- Names from game text (species, moves, items, locations) are not implemented yet.
 - Format of `fb.game.code` for 3DS (assumed: 16 hex digits title ID) and the system names `3ds`/`nds`/`gba` are not specified in the plugin API doc.
+- Unverified addresses and assumptions of the ORAS adapter: `docs/games/omega-ruby-alpha-sapphire.md`, section Open points.

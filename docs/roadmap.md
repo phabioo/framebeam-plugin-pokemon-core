@@ -1,6 +1,6 @@
 # Roadmap
 
-Status: in progress: skeleton and ORAS adapter. Depends on FrameBeam plugin API v1 (0.11, planned); see https://github.com/phabioo/framebeam `docs/roadmap.md`.
+Status: in progress: skeleton and ORAS adapter; v0.3.0 delivers live team stats, trainer/badges/money, location with names, encounter areas, battle state, wild encounters and names from the game text for Omega Ruby / Alpha Sapphire (v1.0 and v1.4); real-game verification of the derived and battle addresses is open (`docs/games/omega-ruby-alpha-sapphire.md`). Depends on FrameBeam plugin API v1 (0.11, planned); see https://github.com/phabioo/framebeam `docs/roadmap.md`.
 
 ## v0.1 Omega Ruby / Alpha Sapphire (3DS, Gen 6)
 
@@ -9,6 +9,11 @@ Status: in progress: skeleton and ORAS adapter. Depends on FrameBeam plugin API 
 - Asset extraction from the player's own game files into the local plugin cache (box icons, sprites, region map); nothing is stored in this repository.
 - Location/route table keyed by internal IDs, with self-recorded map coordinates; `provides` interface for other plugins.
 - Offsets documented per game in `docs/games/<game>.md`; verified locally by the maintainer with the FrameBeam developer mode.
+
+### Status v0.3.0 (ORAS)
+
+- Done in code (synthetic tests): revisions v1.0/v1.4 with address overrides, live party stats, trainer/badges/money/play time, game text names, zones and encounter areas, `species_info`, battle/encounter tracking with events, region map scan with priority archives and noise filter.
+- Open: verification on a real v1.0 game of the derived and battle addresses (Fabio), Alpha Sapphire, a non-guessed map coordinate table for the region map, encounter type detection (not in RAM).
 
 ## Later
 
