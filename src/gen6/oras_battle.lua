@@ -148,6 +148,7 @@ function M.new(fb, env)
         horde = horde, zone = zone, location = zone and env.location_id(zone) or nil,
         frame = fb.memory.frame and fb.memory.frame() or polls,
       }
+      entry.species_name = env.species_name and env.species_name(first.species) or nil
       encounters[#encounters + 1] = entry
       if #encounters > M.MAX_ENCOUNTERS then table.remove(encounters, 1) end
       fb.events.emit("encounter", entry)

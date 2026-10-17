@@ -247,3 +247,30 @@ t.case("encounters keep the last 64 entries", function()
   local enc = a:encounters()
   t.eq({ #enc, enc[1].seq, enc[64].seq }, { 64, 7, 70 })
 end)
+
+t.case("v0.3.1: the encounter record and event carry the species name once the text is loaded", function()
+  local tb = require("text_build")
+  local formats = require("formats")
+  local rv = mem.rev("v1.0").addr
+  local m = mem.world({ rev = "v1.0", party = { OWN }, trainer = { tid = 1, name = "Me" }, zone = 5, x = 1.0, y = 2.0 })
+  m[#m + 1] = { addr = rv.battle_wild_foes, data = ZERO_FOES }
+  m[#m + 1] = { addr = rv.battle_trainer_foes, data = ZERO_FOES }
+  m[#m + 1] = { addr = rv.battle_wild_mons, data = ZERO_MONS }
+  m[#m + 1] = { addr = rv.battle_trainer_mons, data = ZERO_MONS }
+  local names = {}
+  for i = 0, 29 do names[#names + 1] = "Sp" .. i end
+  local gt = tb.garc({ [98] = tb.build(names), [14] = tb.build({ "a", "b" }) })
+  local c = formats.fake_codec(); c.pk6_decrypt = crypto.decrypt
+  local mock = fb_mock.new({ game = { system = "3ds" }, memory = m, codec = c, i18n_dir = "plugin/i18n", frame = 77,
+    romfs = { ["/a/0/7/3"] = gt } })
+  local a = oras.attach({ fb = mock.fb, game = {}, detected = {} })
+  ticks(a, 200)
+  t.eq(a:name("species", 19), "Sp19")
+  wild_foe_slots(rv, mock, { foe(19, 0x0A0A0A0A, 7, 20) })
+  mem.poke(mock.regions, rv.battle_wild_mons, mem.mons_blob({
+    { species = 25, max_hp = 80, hp = 40, level = 30 }, { species = 19, max_hp = 20, hp = 20, level = 7 } }))
+  ticks(a, 4)
+  t.eq(events(mock, "encounter")[1].species_name, "Sp19")
+  t.eq(a:encounters()[1].species_name, "Sp19")
+  t.eq(a:battle().foes[1].species_name, "Sp19")
+end)

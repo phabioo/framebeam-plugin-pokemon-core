@@ -39,7 +39,8 @@ end)
 t.case("parse rejects bad files without raising", function()
   local good = tb.build({ "x" })
   t.eq({ text.parse("short") }, { nil, "too_short" })
-  t.eq({ text.parse(good .. "\0") }, { nil, "bad_length" })
+  t.eq({ text.parse(good:sub(1, -3)) }, { nil, "bad_length" }, "shorter than declared")
+  t.eq(assert(text.parse(good .. "\0\0")).line(0), "x", "alignment padding is tolerated")
   local broken = good:sub(1, 0x10) .. string.pack("<I4", 99) .. good:sub(0x15)
   t.eq({ text.parse(broken) }, { nil, "bad_section" })
   local f = assert(text.parse(good))
@@ -153,4 +154,36 @@ t.case("decoded lines are cached in memory, nothing is written to the cache", fu
   load(store)
   store.name("species", 1)
   t.eq(next(mock.cache_files), nil)
+end)
+
+-- v0.3.1 ---------------------------------------------------------------------------------------------
+
+local function dex_lines(n)
+  local l = {}
+  for i = 0, n - 1 do l[#l + 1] = "N" .. i end
+  return l
+end
+
+t.case("species list at another file index is found by content; counts are logged", function()
+  local wrong = lines("cat Pokemon ", 400) -- 400 lines with spaces: not a national dex list
+  local arch = tb.garc({
+    [98] = tb.build(wrong), [97] = tb.build(lines("x y ", 800)), [99] = tb.build(dex_lines(730)),
+    [14] = tb.build(lines("M", 20)), [90] = tb.build(lines("L", 40)),
+  })
+  local store, mock = make({ ["/a/0/7/6"] = arch }, "de")
+  t.ok(load(store) or (function() for _ = 1, 100 do store.step() end return store.state() == "done" end)())
+  t.eq(store.name("species", 265), "N265")
+  t.eq(store.name("location", 3), "L3")
+  local line
+  for _, l in ipairs(mock.logs) do if l.level == "info" and l.text:find("game text loaded", 1, true) then line = l.text end end
+  t.ok(line and line:find("species=730", 1, true) and line:find("move=20", 1, true) and line:find("found at file 99", 1, true), line)
+end)
+
+t.case("a plausible species file at 98 is kept; integral floats are accepted as ids", function()
+  local arch = tb.garc({ [98] = tb.build(dex_lines(730)), [99] = tb.build(dex_lines(800)), [14] = tb.build(lines("M", 20)) })
+  local store = make({ ["/a/0/7/6"] = arch }, "de")
+  for _ = 1, 100 do store.step() end
+  t.eq(store.state(), "done")
+  t.eq(store.name("species", 700), "N700")
+  t.eq(store.name("species", 255.0), "N255")
 end)

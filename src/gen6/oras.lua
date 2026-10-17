@@ -1,7 +1,7 @@
 -- Adapter for Pokemon Omega Ruby / Alpha Sapphire (3DS, Gen 6).
 -- Addresses and formats with sources: docs/games/omega-ruby-alpha-sapphire.md.
 -- Backs team (with live stats), boxes, trainer, badges, location, battle, encounters, names
--- (game text), zones/areas (encdata), species_info (personal), icons and the region map.
+-- (game text), zones/areas/locations (encdata), species_info (personal), icons and the region map.
 local pk6 = require("gen6.pk6")
 local growth = require("gen6.growth")
 local personal = require("gen6.personal")
@@ -294,6 +294,7 @@ function M.attach(ctx)
       return rec
     end,
     position = position,
+    species_name = function(species) return peek_name("species", species) end,
     team = read_team,
     location_id = function(zone)
       local zi = zone_store.zone_info(zone, true)
@@ -326,6 +327,7 @@ function M.attach(ctx)
     end
     return {
       icons = icon_store.found(), map = map_store.found(), names = names.ready(), areas = zone_store.found(),
+      locations = zone_store.has_locations(),
       live_stats = live_seen, location = chosen and A("map_id") ~= nil or (not chosen and any_map),
       battle = chosen and battle_mod.available() or (not chosen and any_battle),
       encounters = chosen and battle_mod.available() or (not chosen and any_battle),
@@ -339,6 +341,7 @@ function M.attach(ctx)
 
   function obj:name(kind, id) return names.name(kind, id) end
   function obj:areas() return zone_store.areas() end
+  function obj:locations() return zone_store.locations() end
   function obj:zone_info(zone) return zone_store.zone_info(zone) end
 
   function obj:species_info(species, form)

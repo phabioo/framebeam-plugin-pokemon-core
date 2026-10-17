@@ -163,3 +163,107 @@ t.case("missing or broken archives never raise", function()
   local mock = fb_mock.new({ i18n_dir = "plugin/i18n" })
   t.eq(zones.new(mock.fb, {}).state(), "unsupported")
 end)
+
+-- v0.3.1 ---------------------------------------------------------------------------------------------
+
+-- a ZO pack whose last offset points past the end of the pack (padding) and whose encounter
+-- sub-file is the last real one: the v0.3.0 reader rejected the whole pack
+local function zo_padded(loc, enc)
+  local d = zo(loc, enc)
+  local count = string.unpack("<I2", d, 3)
+  local last = 5 + count * 4
+  return d:sub(1, last - 1) .. string.pack("<I4", #d + 8) .. d:sub(last + 4) .. string.rep("\0", 8)
+end
+
+-- ZO pack with an empty trailing sub-file whose offset is 0 (out of order)
+local function zo_zero_tail(loc, enc)
+  local d = zo(loc, enc)
+  local count = string.unpack("<I2", d, 3)
+  local last = 5 + count * 4
+  return d:sub(1, last - 1) .. string.pack("<I4", 0) .. d:sub(last + 4)
+end
+
+t.case("lenient packs: padded or out-of-order offsets still give the encounter table", function()
+  local kind, rec0, enc = zones.classify(zo_padded(33, { { "grass", 1, 25, 0, 3, 5 } }))
+  t.eq(kind, "zo"); t.eq(#rec0, 0x38); t.eq(#enc, 0xF4)
+  kind, _, enc = zones.classify(zo_zero_tail(33, { { "surf", 1, 7, 0, 3, 5 } }))
+  t.eq(kind, "zo"); t.eq(#enc, 0xF4)
+  -- the encounter sub-file is the last sub-file (4 sub-files only)
+  local four = pack("ZO", { record(5), "e", "s", string.rep("\1", 0x0E) .. slots({ { "grass", 1, 25, 0, 3, 5 } }) })
+  kind, _, enc = zones.classify(four)
+  t.eq(kind, "zo"); t.eq(#enc, 0xF4)
+  local k2, _, e2, why = zones.classify(zo(33))
+  t.eq(k2, "zo"); t.eq(e2, nil); t.eq(why, "enc_too_short")
+  local k3, why3 = zones.classify("ZO" .. u16(9) .. string.rep("\255", 8))
+  t.eq(k3, nil); t.eq(why3, "zo_bad_header")
+end)
+
+local function world2()
+  local z = {
+    zo_padded(10, { { "grass", 1, 25, 0, 3, 5 } }),                 -- zone 0, route
+    zo_zero_tail(10, { { "surf", 1, 7, 0, 20, 30 } }),              -- zone 1, same location
+    zo(20),                                                         -- zone 2, town
+    zo(30, { { "grass", 1, 19, 0, 10, 12 } }),                      -- zone 3
+  }
+  local recs = { record(10), record(10), record(20), record(30), record(40), string.rep("\0", 0x38), record(50) }
+  local entries = {}
+  for i, d in ipairs(z) do entries[i] = (i % 2 == 1) and formats.lz11_literal(d) or d end
+  entries[#entries + 1] = table.concat(recs)
+  entries[#entries + 1] = pack("EN", { "copy" })
+  return { ["/a/0/1/3"] = formats.garc(entries) }
+end
+
+t.case("areas from packs the old reader rejected; locations include towns and table-only zones", function()
+  local store, mock, run = make(world2(), { [10] = "Route A", [20] = "Town B" })
+  t.eq({ store.locations() }, { nil, "not_ready" })
+  run()
+  t.eq(store.state(), "done")
+  local areas = store.areas()
+  t.eq(#areas, 2)
+  t.eq(areas[1].id, 10); t.eq(areas[1].zones, { 0, 1 })
+  t.eq(areas[1].encounters.surf, { { species = 7, form = 0, min = 20, max = 30 } })
+  t.eq(areas[2].id, 30)
+  local locs = store.locations()
+  t.eq(#locs, 5)
+  t.eq(locs[1], { id = 10, name = "Route A", zones = { 0, 1 }, has_encounters = true })
+  t.eq(locs[2], { id = 20, name = "Town B", zones = { 2 }, has_encounters = false })
+  t.eq(locs[3], { id = 30, name = nil, zones = { 3 }, has_encounters = true })
+  t.eq(locs[4], { id = 40, zones = { 4 }, has_encounters = false }, "zone only in the table")
+  t.eq(locs[5], { id = 50, zones = { 6 }, has_encounters = false }, "empty record 5 is skipped")
+  t.eq(store.zone_info(4).location, 40)
+  t.ok(store.has_locations())
+  local line
+  for _, l in ipairs(mock.logs) do if l.level == "info" and l.text:find("zones scanned", 1, true) then line = l.text end end
+  t.ok(line and line:find("4 ZO packs", 1, true) and line:find("2 areas", 1, true) and line:find("5 locations", 1, true), line)
+  t.ok(not line:find("Route", 1, true), "no names in the log")
+end)
+
+t.case("empty areas although ZO packs exist: one warning with the first reason", function()
+  local entries = {}
+  for i = 1, 3 do entries[i] = zo(10 + i) end -- encounter sub-files too short
+  entries[4] = pack("ZO", { record(3), "x", "y", "z" }) -- 4 sub-files, no room for slots
+  local store, mock, run = make({ ["/a/0/1/3"] = formats.garc(entries) })
+  run()
+  t.eq(store.state(), "done"); t.eq(store.found(), false)
+  t.eq(#store.locations(), 4)
+  local n, text = 0, nil
+  for _, l in ipairs(mock.logs) do if l.level == "warn" and l.text:find("no encounter areas", 1, true) then n = n + 1; text = l.text end end
+  t.eq(n, 1); t.ok(text:find("enc_too_short", 1, true), text)
+end)
+
+t.case("the archive is retried when it is not readable yet; a failing entry does not stop the scan", function()
+  local good = world2()["/a/0/1/3"]
+  local calls = 0
+  local mock = fb_mock.new({ game = { system = "3ds" }, codec = formats.fake_codec(), i18n_dir = "plugin/i18n", romfs = {} })
+  mock.fb.rom.romfs = function() calls = calls + 1; if calls <= 3 then return nil end return good end
+  local gf = mock.fb.codec.garc_file
+  mock.fb.codec.garc_file = function(d, i, sub) if i == 2 then error("boom") end return gf(d, i, sub) end
+  local store = zones.new(mock.fb, {})
+  for _ = 1, 100 do store.step() end
+  t.eq(store.state(), "done")
+  t.eq(#store.areas() >= 1, true)
+  local mock2 = fb_mock.new({ game = { system = "3ds" }, codec = formats.fake_codec(), i18n_dir = "plugin/i18n", romfs = {} })
+  local s2 = zones.new(mock2.fb, {})
+  for _ = 1, zones.OPEN_RETRIES + 1 do s2.step() end
+  t.eq(s2.state(), "unsupported")
+end)
