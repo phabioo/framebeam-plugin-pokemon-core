@@ -137,11 +137,12 @@ __mod["core.interface"] = function(...)
 -- Builds the table for fb.provide("pokemon.core", tbl).
 local M = {}
 
-local METHODS = { "team", "box", "box_count", "location", "battle", "encounters", "badges", "icon",
-  "map_candidates", "map_image", "map_selected" }
+local METHODS = { "team", "box", "box_count", "location", "battle", "encounters", "badges", "trainer", "name",
+  "species_info", "areas", "zone_info", "icon", "map_candidates", "map_image", "map_selected" }
 local FEATURE = {
   team = "team", box = "box", location = "location",
-  battle = "battle", encounters = "encounters", badges = "badges", icon = "icons", map_candidates = "map",
+  battle = "battle", encounters = "encounters", badges = "badges", trainer = "trainer", name = "names",
+  areas = "areas", icon = "icons", map_candidates = "map",
 }
 
 local function has(adapter, name)
@@ -153,7 +154,7 @@ function M.new(entry, detected, adapter)
   local api = {}
 
   function api.info()
-    local features = {}
+    local features = { live_stats = false }
     for method, key in pairs(FEATURE) do features[key] = has(adapter, method) end
     -- An adapter may refine features that depend on runtime state (icons found, address set).
     if has(adapter, "features") then
@@ -535,8 +536,14 @@ M.SAVE_EVERY = 10                   -- files between progress writes
 M.INDEX = "map/index.txt"           -- "complete" or "partial", then id TAB w TAB h lines
 M.FILES = "map/files.txt"           -- sorted list of scanned file paths
 M.PROGRESS = "map/progress.txt"     -- number of files fully scanned
+-- Archives named in the Project Pokemon ORAS file list as town map UI / PokeNav screens: scanned first.
+M.PRIORITY = { "/a/0/6/7", "/a/0/6/8", "/a/2/4/8", "/a/2/7/6" }
+-- Noise filter: a decoded candidate is dropped when more than NOISE_RATIO of the sampled
+-- neighbouring pixel pairs differ by more than NOISE_DIFF (sum of the RGB differences, max 765).
+M.NOISE_DIFF, M.NOISE_RATIO, M.NOISE_MIN_PAIRS = 96, 0.5, 200
+M.NOISE_ROWS, M.NOISE_COLS = 64, 128 -- sample grid (bounds the work per candidate)
 
--- Map id per game id, optionally per revision: MAP_ID[game_id] = "<id>" or { rev2 = "<id>" }.
+-- Map id per game id, optionally per revision: MAP_ID[game_id] = "<id>" or { ["v1.0"] = "<id>" }.
 -- Fill after the maintainer confirms the region map image.
 M.MAP_ID = {}
 
@@ -553,6 +560,28 @@ local function hash(id)
   local h = 5381
   for i = 1, #id do h = (h * 33 + id:byte(i)) & 0xFFFFFFFF end
   return string.format("%08x", h)
+end
+
+-- True when the decoded image { width, height, rgba } looks like noise (garbage decode of a wrong
+-- candidate): real maps and UI textures have large smooth areas, noise differs at almost every pixel.
+function M.noisy(img)
+  if type(img) ~= "table" or type(img.rgba) ~= "string" then return false end
+  local w, h, px = img.width, img.height, img.rgba
+  if type(w) ~= "number" or type(h) ~= "number" or w < 2 or h < 1 or #px < w * h * 4 then return false end
+  local ystep = math.max(1, h // M.NOISE_ROWS)
+  local xstep = math.max(1, (w - 1) // M.NOISE_COLS)
+  local pairs_n, strong = 0, 0
+  for y = 0, h - 1, ystep do
+    for x = 0, w - 2, xstep do
+      local o = (y * w + x) * 4 + 1
+      local r1, g1, b1, a1, r2, g2, b2, a2 = px:byte(o, o + 7)
+      if a1 ~= 0 or a2 ~= 0 then
+        pairs_n = pairs_n + 1
+        if math.abs(r1 - r2) + math.abs(g1 - g2) + math.abs(b1 - b2) > M.NOISE_DIFF then strong = strong + 1 end
+      end
+    end
+  end
+  return pairs_n >= M.NOISE_MIN_PAIRS and strong / pairs_n > M.NOISE_RATIO
 end
 
 -- "<path>#<entry>[/<darc path>]" -> path, entry, sub
@@ -611,8 +640,14 @@ function M.new(fb, game_id, revision_fn)
     state = "dirs"
   end
 
-  local function add(id, w, h)
+  -- bclim: the BCLIM bytes; the candidate is decoded once and dropped when the image is mostly noise
+  -- (a failed decode keeps it: only proven garbage is dropped).
+  local function add(id, w, h, bclim)
     if w >= M.MIN_W and h >= M.MIN_H and #cands < M.MAX_CANDIDATES then
+      if bclim and codec.bclim then
+        local ok, img = pcall(codec.bclim, bclim)
+        if ok and type(img) == "table" and M.noisy(img) then return end
+      end
       cands[#cands + 1] = { id = id, w = w, h = h }
     end
   end
@@ -622,14 +657,15 @@ function M.new(fb, game_id, revision_fn)
     -- DARC first: its last member may end in a BCLIM footer that would pass for the archive's own
     if s:sub(1, 4) ~= "darc" then
       local w, h = M.bclim_size(s)
-      if w then add(id, w, h) end
+      if w then add(id, w, h, s) end
     else
       local list = darc.parse(s)
       if list then
         for _, f in ipairs(list) do
           if f.length >= 40 then
-            local fw, fh = M.bclim_size(s:sub(f.offset + 1, f.offset + f.length))
-            if fw then add(id .. "/" .. f.path, fw, fh) end
+            local sub = s:sub(f.offset + 1, f.offset + f.length)
+            local fw, fh = M.bclim_size(sub)
+            if fw then add(id .. "/" .. f.path, fw, fh, sub) end
           end
         end
       end
@@ -701,6 +737,15 @@ function M.new(fb, game_id, revision_fn)
         scan_dir(table.remove(dirs, 1))
       else
         table.sort(files)
+        -- the forum-listed town map archives first, then the rest in path order
+        local first, rest, is_prio = {}, {}, {}
+        for _, p in ipairs(M.PRIORITY) do is_prio[p] = true end
+        for _, p in ipairs(M.PRIORITY) do
+          for _, f in ipairs(files) do if f == p then first[#first + 1] = f; break end end
+        end
+        for _, f in ipairs(files) do if not is_prio[f] then rest[#rest + 1] = f end end
+        files = first
+        for _, f in ipairs(rest) do files[#files + 1] = f end
         cwrite(M.FILES, table.concat(files, "\n") .. "\n")
         cwrite(M.PROGRESS, "0")
         fidx, state = 0, "files"
@@ -807,95 +852,233 @@ return M
 end
 __mod["gen6.oras"] = function(...)
 -- Adapter for Pokemon Omega Ruby / Alpha Sapphire (3DS, Gen 6).
--- Addresses: docs/games/omega-ruby-alpha-sapphire.md. Only team, boxes and
--- revision are backed, plus icon() (gen6.icons) and location() (gen6.oras_location,
--- active only once a zone address is configured); battle/encounters/badges are not implemented.
+-- Addresses and formats with sources: docs/games/omega-ruby-alpha-sapphire.md.
+-- Backs team (with live stats), boxes, trainer, badges, location, battle, encounters, names
+-- (game text), zones/areas (encdata), species_info (personal), icons and the region map.
 local pk6 = require("gen6.pk6")
 local growth = require("gen6.growth")
 local personal = require("gen6.personal")
 local icons = require("gen6.icons")
 local maps = require("gen6.maps")
-local oras_location = require("gen6.oras_location")
+local addr = require("gen6.oras_addr")
+local text = require("gen6.text")
+local zones = require("gen6.zones")
+local oras_battle = require("gen6.oras_battle")
 
 local M = {}
 
-M.PARTY_SLOTS = 6
-M.PARTY_STRIDE = 0x1E4 -- Rev 2 EUR: member 2 sits at +0x3C8 = 2 x stride; order/stride still open
+M.PARTY_SLOTS = addr.PARTY_SLOTS
+M.PARTY_STRIDE = addr.PARTY_STRIDE -- 0x1E4: encrypted PK6 (0xE8) at +0, encrypted party stats (22 bytes) at +0x158
+M.STATS_OFFSET, M.STATS_LEN = 0x158, 22
 M.PARTY_SIZE = pk6.SIZE_PARTY
-M.BOX_COUNT = 31
-M.BOX_SLOTS = 30
-M.BOX_SIZE = pk6.SIZE_STORED
+M.BOX_COUNT = addr.BOX_COUNT
+M.BOX_SLOTS = addr.BOX_SLOTS
+M.BOX_SIZE = addr.BOX_SIZE
+M.REVISIONS = addr.REVISIONS
+M.NAME_START_TICK, M.NAME_STEP_EVERY = 20, 4   -- game text loading (ticks % 4 == 2)
+M.ZONE_START_TICK, M.ZONE_STEP_EVERY = 30, 4   -- zone scan (ticks % 4 == 1)
 M.ICON_START_TICK = 90 -- ticks before icon discovery starts
 M.ICON_STEP_EVERY = 8  -- ticks between discovery steps
 M.MAP_START_TICK = 120 -- map scan starts later; steps are offset from icon steps
 M.MAP_STEP_EVERY = 8 -- steps fall on the odd half of the icon cadence
+M.DETECT_EVERY = 5
+M.CROSSCHECK_EVERY = 30
 M.ORIGIN_AS, M.ORIGIN_OR = 26, 27 -- PKHeX GameVersion (X 24, Y 25)
+M.MAX_MONEY = 999999
+M.MAX_STAT = 1500 -- upper bound for a stat or HP value (Blissey at level 100: 714)
 
--- Candidate address sets, checked in this order.
-M.REVISIONS = {
-  { name = "rev2", party = 0x08CF727C, box = 0x08C9A144 },   -- verified: Omega Ruby EUR Rev 2
-  { name = "rev0_1", party = 0x08CFB26C, box = 0x08C9E134 }, -- community addresses, unverified
-}
+-- MyStatus block offsets (PKHeX MyStatus6)
+local MS_TID, MS_VERSION, MS_LANGUAGE, MS_OT = 0, 4, 0x2D, 0x48
+-- Misc block offsets (PKHeX Misc6AO)
+local MISC_MONEY, MISC_BADGES = 8, 0xC
 
-local PARTY_LEN = (M.PARTY_SLOTS - 1) * M.PARTY_STRIDE + M.PARTY_SIZE
-local BOX_LEN = M.BOX_COUNT * M.BOX_SLOTS * M.BOX_SIZE
+-- Sanity of decrypted party stats (garbage decrypts almost never pass; an all-zero area decrypts to
+-- garbage): level 1..100, 0 < max HP, HP <= max HP, every battle stat plausible.
+function M.live_sane(x)
+  if x.level < 1 or x.level > 100 or x.max_hp < 1 or x.max_hp > M.MAX_STAT or x.hp > x.max_hp then return false end
+  for _, v in pairs(x.stats) do
+    if v < 1 or v > M.MAX_STAT then return false end
+  end
+  return true
+end
 
-local function read_record(fb, addr, size)
-  local raw = fb.memory.bytes(addr, size)
-  if not raw or #raw < size then return nil end
-  if not (fb.codec and fb.codec.pk6_decrypt) then return nil end
-  local plain, ok = fb.codec.pk6_decrypt(raw)
-  if not plain or not ok then return nil end
-  local rec = pk6.parse(plain)
-  if not rec or rec.species < 1 or rec.species > pk6.MAX_SPECIES then return nil end
-  return rec
+local function popcount(v)
+  local n = 0
+  while v ~= 0 do n = n + (v & 1); v = v >> 1 end
+  return n
 end
 
 function M.attach(ctx)
   local fb = ctx.fb
   local pers = personal.new(fb)
   local icon_store = icons.new(fb, pers)
-  local zone = oras_location.new(fb)
   local ticks = 0
-  local map_store
+  local map_store, names, zone_store, battle_mod
   local chosen
+  local live_seen, checked = false, false
+  local last_loc_key
+  local warned = {}
 
-  for _, set in ipairs(M.REVISIONS) do
-    fb.memory.watch("oras." .. set.name .. ".party", set.party, PARTY_LEN)
-    fb.memory.watch("oras." .. set.name .. ".box", set.box, BOX_LEN)
+  local overrides = addr.load_overrides(fb)
+  for _, line in ipairs(overrides.bad) do
+    if fb.log and fb.log.warn then fb.log.warn("ignored address override line: " .. line) end
   end
 
-  local function detect()
-    if chosen then return chosen end
-    for _, set in ipairs(M.REVISIONS) do
-      if read_record(fb, set.party, M.PARTY_SIZE) then chosen = set; return chosen end
+  local sets = {}
+  for i, rev in ipairs(addr.REVISIONS) do
+    sets[i] = { name = rev.name, a = addr.resolve(rev, overrides), state = rev.state }
+    for _, key in ipairs(addr.KEYS) do
+      local a = sets[i].a[key]
+      if a then fb.memory.watch("oras." .. rev.name .. "." .. key, a, addr.LENGTHS[key]) end
+    end
+  end
+
+  local function warn_once(key, msg)
+    if warned[key] then return end
+    warned[key] = true
+    if fb.log and fb.log.warn then fb.log.warn(msg) end
+  end
+
+  local function A(key) return chosen and chosen.a[key] or nil end
+
+  -- Plain PK6 -> record, nil when invalid (checksum, species 1..721).
+  local function decode(buf)
+    if not (fb.codec and fb.codec.pk6_decrypt) then return nil end
+    local plain, ok = fb.codec.pk6_decrypt(buf)
+    if not plain or not ok then return nil end
+    local rec = pk6.parse(plain)
+    if not rec or rec.species < 1 or rec.species > pk6.MAX_SPECIES then return nil end
+    return rec
+  end
+
+  local function read_record(base, size)
+    local raw = fb.memory.bytes(base, size)
+    if not raw or #raw < size then return nil end
+    return decode(raw)
+  end
+
+  -- Live party slot: 0xE8 encrypted bytes at +0 and 22 encrypted party-stat bytes at +0x158 (a fresh
+  -- stream seeded with the EC) are joined into the 260-byte save layout. Level, HP, max HP and
+  -- status are taken only when they pass a sanity check. Returns record, live (bool).
+  local function read_party_slot(base)
+    local raw = fb.memory.bytes(base, 0xE8)
+    if not raw or #raw < 0xE8 then return nil end
+    local stats = fb.memory.bytes(base + M.STATS_OFFSET, M.STATS_LEN) or string.rep("\0", M.STATS_LEN)
+    local buf = raw .. stats .. string.rep("\0", pk6.SIZE_PARTY - 0xE8 - M.STATS_LEN)
+    local rec = decode(buf)
+    if not rec then return nil end
+    local x = rec.party_ext
+    rec.party_ext = nil
+    if x and M.live_sane(x) then
+      rec.level, rec.hp, rec.max_hp, rec.status = x.level, x.hp, x.max_hp, x.status
+      return rec, true
+    end
+    return rec, false
+  end
+
+  local function peek_name(kind, id)
+    if names then
+      local n = names.peek(kind, id)
+      if type(n) == "string" then return n end
     end
     return nil
   end
 
   local function finish(rec)
-    local rate = pers.growth_rate(rec.species)
-    if rate then rec.level = growth.level_from_exp(rate, rec.exp) end
+    if rec.level == nil then
+      local rate = pers.growth_rate(rec.species)
+      if rate then rec.level = growth.level_from_exp(rate, rec.exp) end
+    end
+    rec.species_name = peek_name("species", rec.species)
     return rec
   end
 
-  local obj = {}
-  map_store = maps.new(fb, ctx.game and ctx.game.id, function() return chosen and chosen.name end)
-
-  function obj:revision()
-    local set = detect()
-    if not set then return nil, "not_ready" end
-    return set.name
+  local function detect()
+    if chosen then return chosen end
+    for _, set in ipairs(sets) do
+      if set.a.party and read_party_slot(set.a.party) then
+        chosen = set
+        for _, other in ipairs(sets) do
+          if other ~= set then
+            for _, key in ipairs(addr.KEYS) do
+              if other.a[key] then fb.memory.unwatch("oras." .. other.name .. "." .. key) end
+            end
+          end
+        end
+        if fb.log and fb.log.info then fb.log.info("game revision " .. set.name) end
+        return chosen
+      end
+    end
+    return nil
   end
 
-  -- Heuristic (no save-block language offset is sourced): the language of the
-  -- player's own catches. Party records with origin game AS/OR (PKHeX
-  -- GameVersion 26/27) are grouped by OT ID/SID; the largest group (earliest
-  -- slot on ties) is taken as the player's and its first member's language
-  -- is returned. A Pokemon traded in from another-language OR/AS game can
-  -- fool it. nil when there is no such record.
+  local function u16(a) return a and fb.memory.u16(a) or nil end
+
+  local function f32(a)
+    local b = a and fb.memory.bytes(a, 4)
+    if not b or #b < 4 then return nil end
+    local v = string.unpack("<f", b)
+    if v ~= v or v > 1e7 or v < -1e7 then return nil end
+    return v
+  end
+
+  -- MyStatus block: { name, tid, sid, version, language_id, language } or nil.
+  local function mystatus()
+    local base = A("mystatus")
+    local raw = base and fb.memory.bytes(base, 0x70)
+    if not raw or #raw < 0x70 then return nil end
+    local tid, sid = string.unpack("<I2I2", raw, MS_TID + 1)
+    local lang_id = raw:byte(MS_LANGUAGE + 1)
+    return {
+      name = pk6.utf16le_to_utf8(raw:sub(MS_OT + 1, MS_OT + 0x1A), 12),
+      tid = tid, sid = sid, version = raw:byte(MS_VERSION + 1),
+      language_id = lang_id, language = pk6.LANGUAGES[lang_id],
+    }
+  end
+
+  -- Own-origin party members must carry the trainer's TID, otherwise the revision (or the MyStatus
+  -- address) is wrong. Runs until it had something to compare, logs a warning on a mismatch.
+  local function crosscheck(team)
+    if checked or not chosen then return end
+    local ms = mystatus()
+    if not ms or ms.name == "" then return end
+    local cands, match = 0, false
+    for _, r in ipairs(team) do
+      if r.origin_game == M.ORIGIN_AS or r.origin_game == M.ORIGIN_OR then
+        cands = cands + 1
+        if r.ot_id == ms.tid then match = true end
+      end
+    end
+    if cands == 0 then return end
+    checked = true
+    if not match then
+      warn_once("crosscheck", "revision cross-check failed: MyStatus TID " .. ms.tid ..
+        " matches no own party member; revision " .. chosen.name .. " or the mystatus address may be wrong")
+    end
+  end
+
+  local function read_team()
+    local set = detect()
+    if not set then return nil end
+    local out = {}
+    for i = 1, M.PARTY_SLOTS do
+      local rec, live = read_party_slot(set.a.party + (i - 1) * M.PARTY_STRIDE)
+      if rec then
+        rec.slot = i
+        if live then live_seen = true end
+        out[#out + 1] = finish(rec)
+      end
+    end
+    return out
+  end
+
+  local obj = {}
+
+  -- Language of the game: MyStatus language byte; heuristic fallback (party members of own origin).
   function obj:language()
-    local team = self:team()
+    local ms = mystatus()
+    if ms and ms.language then return ms.language end
+    local team = read_team()
     if not team then return nil end
     local groups, order = {}, {}
     for _, r in ipairs(team) do
@@ -912,43 +1095,182 @@ function M.attach(ctx)
     return best and best.first.language or nil
   end
 
-  -- Called every tick by main.lua: spreads icon discovery over many ticks.
+  names = text.new(fb, { language_fn = function() return obj:language() end })
+  zone_store = zones.new(fb, { name = function(kind, id) return names.peek(kind, id) end })
+  map_store = maps.new(fb, ctx.game and ctx.game.id, function() return chosen and chosen.name end)
+
+  function obj:revision()
+    local set = detect()
+    if not set then return nil, "not_ready" end
+    return set.name
+  end
+
+  local function location_info(quiet)
+    local set = detect()
+    if not set then return nil, "not_ready" end
+    local a = A("map_id")
+    if not a then return nil, "unsupported" end
+    local zone = u16(a)
+    if zone == nil then return nil, "not_ready" end
+    local out = { zone = zone, source = "memory", x = f32(A("player_x")), y = f32(A("player_y")) }
+    local zi = zone_store.zone_info(zone, quiet)
+    if zi then out.location, out.name = zi.location, zi.name end
+    return out
+  end
+
+  local function poll()
+    if not chosen then return end
+    local loc = location_info(true)
+    if loc then
+      local key = loc.zone .. ":" .. tostring(loc.location) .. ":" .. tostring(loc.name)
+      if key ~= last_loc_key then
+        last_loc_key = key
+        fb.events.emit("location.changed", loc)
+      end
+    end
+    if battle_mod then battle_mod.poll() end
+    if not checked and ticks % M.CROSSCHECK_EVERY == 0 then
+      local team = read_team()
+      if team then crosscheck(team) end
+    end
+  end
+
+  local function position()
+    return u16(A("map_id")), f32(A("player_x")), f32(A("player_y"))
+  end
+
+  battle_mod = oras_battle.new(fb, {
+    addr = A,
+    read_slot = function(base)
+      local rec = read_party_slot(base)
+      if rec then rec = finish(rec) end
+      return rec
+    end,
+    position = position,
+    team = read_team,
+    location_id = function(zone)
+      local zi = zone_store.zone_info(zone, true)
+      return zi and zi.location or nil
+    end,
+  })
+
+  -- Called every tick by main.lua: bounded background work and the state tracking.
   function obj:tick()
     ticks = ticks + 1
+    if not chosen and ticks % M.DETECT_EVERY == 0 then detect() end
+    if ticks >= M.NAME_START_TICK and ticks % M.NAME_STEP_EVERY == 2 then names.step() end
+    if ticks >= M.ZONE_START_TICK and ticks % M.ZONE_STEP_EVERY == 1 then zone_store.step() end
     if ticks >= M.MAP_START_TICK and ticks % M.MAP_STEP_EVERY == M.MAP_STEP_EVERY // 2 and map_store.state() ~= "done" then
       map_store.step()
     end
     if ticks >= M.ICON_START_TICK and ticks % M.ICON_STEP_EVERY == 0 and icon_store.state() ~= "done" then
       icon_store.step()
     end
+    local ok, err = pcall(poll)
+    if not ok then warn_once("poll", "tracking failed: " .. tostring(err)) end
   end
 
-  -- Feature overrides: icons only once the GARC is found, location only with an address.
+  -- Feature overrides: depend on runtime state (icons found, names loaded, ...).
   function obj:features()
-    return { icons = icon_store.found(), location = zone.configured(), map = map_store.found() }
+    local any_map, any_battle = false, false
+    for _, set in ipairs(sets) do
+      if set.a.map_id then any_map = true end
+      if set.a.battle_wild_foes or set.a.battle_trainer_foes then any_battle = true end
+    end
+    return {
+      icons = icon_store.found(), map = map_store.found(), names = names.ready(), areas = zone_store.found(),
+      live_stats = live_seen, location = chosen and A("map_id") ~= nil or (not chosen and any_map),
+      battle = chosen and battle_mod.available() or (not chosen and any_battle),
+      encounters = chosen and battle_mod.available() or (not chosen and any_battle),
+    }
   end
 
-  function obj:icon(species, form)
-    return icon_store.icon(species, form)
-  end
-
+  function obj:icon(species, form) return icon_store.icon(species, form) end
   function obj:map_candidates() return map_store.candidates() end
   function obj:map_image(id) return map_store.image(id) end
   function obj:map_selected() return map_store.selected() end
 
-  function obj:location()
-    return zone.zone(chosen and chosen.name or nil)
+  function obj:name(kind, id) return names.name(kind, id) end
+  function obj:areas() return zone_store.areas() end
+  function obj:zone_info(zone) return zone_store.zone_info(zone) end
+
+  function obj:species_info(species, form)
+    if not pers.growth_rate(1) then return nil, "not_ready" end
+    return pers.info(species, form or 0)
   end
 
+  function obj:location() return location_info(false) end
+
   function obj:team()
+    local team = read_team()
+    if not team then return nil, "not_ready" end
+    crosscheck(team)
+    return team
+  end
+
+  function obj:trainer()
     local set = detect()
     if not set then return nil, "not_ready" end
-    local out = {}
-    for i = 1, M.PARTY_SLOTS do
-      local rec = read_record(fb, set.party + (i - 1) * M.PARTY_STRIDE, M.PARTY_SIZE)
-      if rec then rec.slot = i; out[#out + 1] = finish(rec) end
+    local ms = mystatus()
+    if not ms or ms.name == "" then return nil, "not_ready" end
+    local out = {
+      name = ms.name, tid = ms.tid, sid = ms.sid, version = ms.version, language = ms.language,
+    }
+    local misc = A("misc")
+    if misc then
+      local money = fb.memory.u32(misc + MISC_MONEY)
+      if money and money <= M.MAX_MONEY then out.money = money end
+      local b = fb.memory.u8(misc + MISC_BADGES)
+      if b then out.badges = popcount(b) end
+    end
+    local pt = A("play_time")
+    local raw = pt and fb.memory.bytes(pt, 4)
+    if raw and #raw == 4 then
+      local h, m, s = string.unpack("<I2I1I1", raw)
+      if m < 60 and s < 60 then out.play_time = { h = h, m = m, s = s } end
     end
     return out
+  end
+
+  function obj:badges()
+    local set = detect()
+    if not set then return nil, "not_ready" end
+    local misc = A("misc")
+    if not misc then return nil, "unsupported" end
+    local b = fb.memory.u8(misc + MISC_BADGES)
+    if b == nil then return nil, "not_ready" end
+    local flags = {}
+    for i = 1, 8 do flags[i] = (b >> (i - 1)) & 1 == 1 end
+    return { count = popcount(b), flags = flags }
+  end
+
+  -- Event flag n (0..0xCFF) of the save, or nil. Not part of the interface yet.
+  function obj:event_flag(n)
+    if not detect() then return nil end
+    local base = A("event_flags")
+    if not base or math.type(n) ~= "integer" or n < 0 or n >= 0xD00 then return nil end
+    local b = fb.memory.u8(base + (n >> 3))
+    if b == nil then return nil end
+    return (b >> (n & 7)) & 1 == 1
+  end
+
+  function obj:battle()
+    if not detect() then return nil, "not_ready" end
+    if not battle_mod.available() then return nil, "unsupported" end
+    local b = battle_mod.battle()
+    if b.active then
+      for _, f in ipairs(b.foes) do f.species_name = peek_name("species", f.species) end
+      for _, o in ipairs(b.own) do o.species_name = peek_name("species", o.species) end
+    end
+    return b
+  end
+
+  function obj:encounters()
+    if not detect() then return nil, "not_ready" end
+    if not battle_mod.available() then return nil, "unsupported" end
+    local list = battle_mod.encounters()
+    for _, e in ipairs(list) do e.species_name = peek_name("species", e.species) end
+    return list
   end
 
   function obj:box_count()
@@ -960,11 +1282,11 @@ function M.attach(ctx)
     local set = detect()
     if not set then return nil, "not_ready" end
     if math.type(n) ~= "integer" or n < 1 or n > M.BOX_COUNT then return nil, "out_of_range" end
-    local base = set.box + (n - 1) * M.BOX_SLOTS * M.BOX_SIZE
+    local base = set.a.box + (n - 1) * M.BOX_SLOTS * M.BOX_SIZE
     if not fb.memory.bytes(base, M.BOX_SLOTS * M.BOX_SIZE) then return nil, "not_ready" end
     local out = {}
     for s = 1, M.BOX_SLOTS do
-      local rec = read_record(fb, base + (s - 1) * M.BOX_SIZE, M.BOX_SIZE)
+      local rec = read_record(base + (s - 1) * M.BOX_SIZE, M.BOX_SIZE)
       if rec then rec.slot = s; rec.box = n; out[#out + 1] = finish(rec) end
     end
     return out
@@ -976,17 +1298,80 @@ end
 return M
 
 end
-__mod["gen6.oras_location"] = function(...)
--- Current zone id of Omega Ruby / Alpha Sapphire, read from emulator memory.
--- The RAM address is not known yet: ZONE_ADDR is empty until a local probe finds
--- it. Meanwhile an address (hex) can be set without a release in the plugin
--- cache file config/zone_addr.txt (read once at attach; reload the plugin).
+__mod["gen6.oras_addr"] = function(...)
+-- Address tables of Omega Ruby / Alpha Sapphire per game revision, and the address overrides.
+-- Every value and its source: docs/games/omega-ruby-alpha-sapphire.md. A nil entry means "no
+-- address known" (reported as open, never guessed).
+--
+-- Revisions are game versions (update patches), not regions: "v1.0" (no update) and "v1.4"
+-- (final update). Inside the save-data range 0x08C6xxxx-0x08CFxxxx v1.4 = v1.0 + 0x3FF0.
 local M = {}
 
--- Fill from local probe, keyed by revision name of gen6.oras (rev2, rev0_1).
--- Value: virtual address of the u16 zone id.
-M.ZONE_ADDR = {}
-M.OVERRIDE_FILE = "config/zone_addr.txt"
+M.SHIFT = 0x3FF0
+M.OVERRIDE_FILE = "config/addresses.txt"
+M.ZONE_OVERRIDE_FILE = "config/zone_addr.txt" -- older single override, equals the key map_id
+
+-- Layout constants shared by adapter and tests.
+M.PARTY_STRIDE = 0x1E4
+M.PARTY_SLOTS = 6
+M.BOX_COUNT, M.BOX_SLOTS, M.BOX_SIZE = 31, 30, 232
+M.MON_STRIDE, M.MON_SLOTS = 0x244, 8
+M.FLAG_BATTLE = 0x00040001
+
+-- key -> watched length in bytes
+M.LENGTHS = {
+  party = M.PARTY_SLOTS * M.PARTY_STRIDE,
+  box = M.BOX_COUNT * M.BOX_SLOTS * M.BOX_SIZE,
+  mystatus = 0x70,   -- TID +0, SID +2, version +4, language +0x2D, OT name +0x48 (0x1A bytes)
+  misc = 0x10,       -- money u32 +8, badges u8 bitfield +0xC
+  play_time = 4,     -- u16 hours, u8 minutes, u8 seconds
+  map_id = 4,        -- u16 zone id, u16 facing
+  player_x = 4,      -- f32
+  player_y = 4,      -- f32
+  event_flags = 0x1A0, -- 0xD00 flag bits
+  battle_flag = 4,   -- u32, == FLAG_BATTLE while in battle (v1.4 only)
+  battle_wild_foes = M.PARTY_SLOTS * M.PARTY_STRIDE,
+  battle_trainer_foes = M.PARTY_SLOTS * M.PARTY_STRIDE,
+  battle_wild_mons = M.MON_SLOTS * M.MON_STRIDE,
+  battle_trainer_mons = M.MON_SLOTS * M.MON_STRIDE,
+}
+M.KEYS = {} -- sorted key names
+for k in pairs(M.LENGTHS) do M.KEYS[#M.KEYS + 1] = k end
+table.sort(M.KEYS)
+
+-- State per address: "M" measured (first-hand or by tools on that exact version), "D" derived
+-- (v1.4 community value - 0x3FF0), "C" community value for that version, "U" unverified (single
+-- source, other version or arithmetic), see the docs.
+M.REVISIONS = {
+  {
+    name = "v1.0",
+    addr = {
+      party = 0x08CF727C, box = 0x08C9A144,
+      mystatus = 0x08C7D350, misc = 0x08C6DDC8, play_time = 0x08CF7D98,
+      map_id = 0x08C6A894, player_x = 0x08C6A8A4, player_y = 0x08C6A8AC, event_flags = 0x08C7DDDC,
+      battle_wild_foes = 0x08805638, battle_trainer_foes = 0x08804AF4,
+      battle_wild_mons = 0x082041F4, battle_trainer_mons = 0x08205D04,
+    },
+    state = {
+      party = "M", box = "M", misc = "M", mystatus = "D", play_time = "D", map_id = "D", player_x = "D",
+      player_y = "D", event_flags = "D", battle_wild_foes = "U", battle_trainer_foes = "U",
+      battle_wild_mons = "U", battle_trainer_mons = "U",
+    },
+  },
+  {
+    name = "v1.4",
+    addr = {
+      party = 0x08CFB26C, box = 0x08C9E134,
+      mystatus = 0x08C81340, misc = 0x08C71DB8, play_time = 0x08CFBD88,
+      map_id = 0x08C6E884, player_x = 0x08C6E894, player_y = 0x08C6E89C, event_flags = 0x08C81DCC,
+      battle_flag = 0x081FB478, battle_wild_foes = 0x081FFA6C,
+    },
+    state = {
+      party = "C", box = "C", misc = "C", mystatus = "C", play_time = "C", map_id = "C", player_x = "C",
+      player_y = "C", event_flags = "C", battle_flag = "C", battle_wild_foes = "C",
+    },
+  },
+}
 
 -- "0x08C12345" or "08C12345" -> integer; nil when not a nonzero 32 bit hex number.
 function M.parse_addr(s)
@@ -998,37 +1383,327 @@ function M.parse_addr(s)
   return n
 end
 
-function M.new(fb)
+local function known_revision(name)
+  for _, r in ipairs(M.REVISIONS) do if r.name == name then return true end end
+  return false
+end
+
+-- Parses the text of config/addresses.txt. Lines: `key=0xADDR` (all revisions) or
+-- `v1.0.key=0xADDR` (one revision); `#` starts a comment. Returns
+-- { generic = {key=addr}, rev = {["v1.0"] = {key=addr}}, bad = { "line text", ... } }.
+function M.parse_overrides(text)
+  local out = { generic = {}, rev = {}, bad = {} }
+  if type(text) ~= "string" then return out end
+  for line in (text .. "\n"):gmatch("([^\r\n]*)\r?\n") do
+    local l = line:gsub("#.*$", ""):match("^%s*(.-)%s*$")
+    if l ~= "" then
+      local key, val = l:match("^([%w_%.]+)%s*=%s*(.-)$")
+      local addr = M.parse_addr(val)
+      local rev, k = nil, key
+      if key then
+        local r, rest = key:match("^(v%d+%.%d+)%.([%w_]+)$")
+        if r then rev, k = r, rest end
+      end
+      if addr and k and M.LENGTHS[k] and (rev == nil or known_revision(rev)) then
+        if rev then
+          out.rev[rev] = out.rev[rev] or {}
+          out.rev[rev][k] = addr
+        else
+          out.generic[k] = addr
+        end
+      else
+        out.bad[#out.bad + 1] = l
+      end
+    end
+  end
+  return out
+end
+
+-- Reads both override files from the plugin cache. config/zone_addr.txt sets map_id for all revisions.
+function M.load_overrides(fb)
+  local function read(name)
+    if fb.cache and fb.cache.read then
+      local ok, v = pcall(fb.cache.read, name)
+      if ok and type(v) == "string" then return v end
+    end
+  end
+  local ov = M.parse_overrides(read(M.OVERRIDE_FILE))
+  local z = M.parse_addr(read(M.ZONE_OVERRIDE_FILE))
+  if z then ov.generic.map_id = z end
+  return ov
+end
+
+-- Effective addresses for one revision: revision override > generic override > table.
+function M.resolve(rev, overrides)
+  local out = {}
+  for k in pairs(M.LENGTHS) do out[k] = rev.addr[k] end
+  if overrides then
+    for k, a in pairs(overrides.generic or {}) do out[k] = a end
+    for k, a in pairs((overrides.rev or {})[rev.name] or {}) do out[k] = a end
+  end
+  return out
+end
+
+return M
+
+end
+__mod["gen6.oras_battle"] = function(...)
+-- Battle state and wild encounters of Omega Ruby / Alpha Sapphire, derived from emulator memory.
+-- The opponent party buffers and the battle-mon arrays PERSIST after a battle, so "in battle" is
+-- inferred (docs/games/omega-ruby-alpha-sapphire.md, section Battle):
+--   start : the content of an opponent buffer (slot 1) changed to valid, checksummed PK6 data AND
+--           the battle-mon array holds a plausible entry matching it (AND, where an address is
+--           known, the in-battle flag reads 0x00040001);
+--   end   : the in-battle flag drops, or the map/zone changes, or the overworld position changes,
+--           or the battle-mon array no longer matches the foes (3 polls in a row).
+-- Wild vs trainer = which buffer changed. Horde = foe slots 2..5 all valid (and matched).
+local addr = require("gen6.oras_addr")
+
+local M = {}
+
+M.PENDING_POLLS = 150  -- polls to wait for the battle-mon array after the buffer changed
+M.END_MISS = 3         -- polls without a matching battle-mon before the battle counts as over
+M.POS_EPSILON = 0.01   -- overworld position change that ends a battle
+M.MAX_ENCOUNTERS = 64
+M.WILD_SLOTS, M.TRAINER_SLOTS = 5, 6
+M.MON_SPECIES, M.MON_MAX_HP, M.MON_HP, M.MON_LEVEL = 0x0C, 0x0E, 0x10, 0x18
+M.MAX_SPECIES = 721
+local RAW_LEN = 0xE8
+
+-- env: addr(key) -> address|nil, read_slot(address) -> record|nil (checksummed, live stats merged),
+--      position() -> zone, x, y, team() -> list|nil, location_id(zone) -> id|nil
+function M.new(fb, env)
   local self = {}
-  local override
-  if fb.cache and fb.cache.read then
-    local ok, v = pcall(fb.cache.read, M.OVERRIDE_FILE)
-    if ok then override = M.parse_addr(v) end
+  local st = { active = false }
+  local last_raw = {}
+  local pending = {}
+  local encounters, seq = {}, 0
+  local polls = 0
+
+  local function kind_addr(kind, what) return env.addr("battle_" .. kind .. "_" .. what) end
+
+  -- Plausible battle-mon entries { species, max_hp, hp, level, index }; nil when no array address,
+  -- {} when the array is unreadable.
+  local function read_mons(kind)
+    local a = kind_addr(kind, "mons")
+    if not a then return nil end
+    local raw = fb.memory.bytes(a, addr.MON_SLOTS * addr.MON_STRIDE)
+    local out = {}
+    if not raw then return out end
+    for i = 0, addr.MON_SLOTS - 1 do
+      local o = i * addr.MON_STRIDE
+      local species = string.unpack("<I2", raw, o + M.MON_SPECIES + 1)
+      local max_hp = string.unpack("<I2", raw, o + M.MON_MAX_HP + 1)
+      local hp = string.unpack("<I2", raw, o + M.MON_HP + 1)
+      local level = raw:byte(o + M.MON_LEVEL + 1)
+      if species >= 1 and species <= M.MAX_SPECIES and max_hp >= 1 and hp <= max_hp and level >= 1 and level <= 100 then
+        out[#out + 1] = { species = species, max_hp = max_hp, hp = hp, level = level, index = i }
+      end
+    end
+    return out
   end
 
-  if override then fb.memory.watch("oras.zone", override, 2) end
-  for rev, addr in pairs(M.ZONE_ADDR) do fb.memory.watch("oras." .. rev .. ".zone", addr, 2) end
-
-  -- Address for a revision (nil = revision unknown); the override wins.
-  function self.address(rev)
-    if override then return override end
-    if rev then return M.ZONE_ADDR[rev] end
-    return nil
+  -- Valid PK6 records of an opponent buffer in slot order.
+  local function candidates(kind)
+    local a = kind_addr(kind, "foes")
+    if not a then return {} end
+    local n = kind == "wild" and M.WILD_SLOTS or M.TRAINER_SLOTS
+    local out = {}
+    for i = 1, n do
+      local rec = env.read_slot(a + (i - 1) * addr.PARTY_STRIDE)
+      if rec then rec.slot = i; out[#out + 1] = rec end
+    end
+    return out
   end
 
-  -- True when some address could apply (override, or any table entry).
-  function self.configured()
-    return override ~= nil or next(M.ZONE_ADDR) ~= nil
+  local function matches(rec, mon)
+    return mon.species == rec.species and (rec.level == nil or mon.level == rec.level)
   end
 
-  -- { zone = u16, source = "memory" } or nil, "unsupported" | "not_ready"
-  function self.zone(rev)
-    if not self.configured() then return nil, "unsupported" end
-    local addr = self.address(rev)
-    if not addr then return nil, "not_ready" end
-    local z = fb.memory.u16(addr)
-    if z == nil then return nil, "not_ready" end
-    return { zone = z, source = "memory" }
+  local function foe_record(rec, mon)
+    return {
+      species = rec.species, form = rec.form, level = mon and mon.level or rec.level,
+      hp = mon and mon.hp or rec.hp, max_hp = mon and mon.max_hp or rec.max_hp,
+      shiny = rec.shiny, personality = rec.personality,
+    }
+  end
+
+  -- Foes and horde flag of the battle of `kind` from the current memory.
+  local function compute_foes(kind)
+    local cands = candidates(kind)
+    local mons = read_mons(kind)
+    local foes, used, horde_slots = {}, {}, 0
+    for _, rec in ipairs(cands) do
+      local mon
+      if mons then
+        for j = #mons, 1, -1 do
+          if not used[j] and matches(rec, mons[j]) then used[j] = true; mon = mons[j]; break end
+        end
+      end
+      local active = mons == nil and rec.slot == 1 or mon ~= nil
+      if active then
+        foes[#foes + 1] = foe_record(rec, mon)
+        if rec.slot >= 2 then horde_slots = horde_slots + 1 end
+      end
+    end
+    local horde = kind == "wild" and horde_slots >= 4
+    if mons == nil and kind == "wild" then -- no array: horde = slots 2..5 valid
+      local n = 0
+      for _, rec in ipairs(cands) do if rec.slot >= 2 then n = n + 1 end end
+      horde = n >= 4
+      foes = {}
+      for _, rec in ipairs(cands) do
+        if rec.slot == 1 or horde then foes[#foes + 1] = foe_record(rec, nil) end
+      end
+    end
+    return foes, horde, mons, used
+  end
+
+  local function flag_ok()
+    local a = env.addr("battle_flag")
+    if not a then return true end
+    return fb.memory.u32(a) == addr.FLAG_BATTLE
+  end
+
+  local function confirmed(kind)
+    local cands = candidates(kind)
+    local first = cands[1]
+    if not first or first.slot ~= 1 then return false end
+    local mons = read_mons(kind)
+    if mons ~= nil then
+      local hit = false
+      for _, m in ipairs(mons) do if matches(first, m) then hit = true; break end end
+      if not hit then return false end
+    end
+    return flag_ok()
+  end
+
+  local function species_list(foes)
+    local out = {}
+    for i, f in ipairs(foes) do out[i] = f.species end
+    return out
+  end
+
+  local function start(kind)
+    local foes, horde = compute_foes(kind)
+    if #foes == 0 then return false end
+    local zone, x, y = env.position()
+    st = { active = true, kind = kind, horde = horde, zone = zone, x = x, y = y, miss = 0 }
+    fb.events.emit("battle.started", { kind = kind, horde = horde, foes = species_list(foes) })
+    if kind == "wild" then
+      seq = seq + 1
+      local first = foes[1]
+      local entry = {
+        seq = seq, species = first.species, form = first.form, level = first.level, shiny = first.shiny,
+        horde = horde, zone = zone, location = zone and env.location_id(zone) or nil,
+        frame = fb.memory.frame and fb.memory.frame() or polls,
+      }
+      encounters[#encounters + 1] = entry
+      if #encounters > M.MAX_ENCOUNTERS then table.remove(encounters, 1) end
+      fb.events.emit("encounter", entry)
+    end
+    return true
+  end
+
+  local function finish()
+    local kind = st.kind
+    st = { active = false }
+    pending = {}
+    fb.events.emit("battle.ended", { kind = kind })
+  end
+
+  local function over()
+    local a = env.addr("battle_flag")
+    if a then
+      local v = fb.memory.u32(a)
+      if v ~= nil and v ~= addr.FLAG_BATTLE then return true end
+    end
+    local zone, x, y = env.position()
+    if zone and st.zone and zone ~= st.zone then return true end
+    if x and y and st.x and st.y
+      and (math.abs(x - st.x) > M.POS_EPSILON or math.abs(y - st.y) > M.POS_EPSILON) then
+      return true
+    end
+    local foes, _, mons = compute_foes(st.kind)
+    if mons ~= nil and #foes == 0 then
+      st.miss = st.miss + 1
+      return st.miss >= M.END_MISS
+    end
+    st.miss = 0
+    return false
+  end
+
+  -- Called every tick. Never raises (the caller wraps it in pcall).
+  function self.poll()
+    polls = polls + 1
+    local any = false
+    for _, kind in ipairs({ "wild", "trainer" }) do
+      local a = kind_addr(kind, "foes")
+      if a then
+        any = true
+        local raw = fb.memory.bytes(a, RAW_LEN)
+        if raw then
+          if last_raw[kind] == nil then
+            last_raw[kind] = raw -- baseline, no event
+          elseif raw ~= last_raw[kind] then
+            last_raw[kind] = raw
+            if not st.active then
+              local rec = env.read_slot(a)
+              if rec then pending[kind] = 0 end
+            end
+          end
+        end
+      end
+    end
+    if not any then return end
+    if st.active then
+      if over() then finish() end
+      return
+    end
+    for _, kind in ipairs({ "wild", "trainer" }) do
+      if pending[kind] then
+        pending[kind] = pending[kind] + 1
+        if confirmed(kind) then
+          pending = {}
+          if start(kind) then return end
+        elseif pending[kind] > M.PENDING_POLLS then
+          pending[kind] = nil
+        end
+      end
+    end
+  end
+
+  function self.available()
+    return env.addr("battle_wild_foes") ~= nil or env.addr("battle_trainer_foes") ~= nil
+  end
+
+  -- { active, kind, horde, foes, own }
+  function self.battle()
+    if not st.active then return { active = false } end
+    local foes, horde, mons, used = compute_foes(st.kind)
+    local own = {}
+    if mons then
+      local team = env.team() or {}
+      local taken = {}
+      for j, m in ipairs(mons) do
+        if not used[j] then
+          for pi, p in ipairs(team) do
+            if not taken[pi] and p.species == m.species and (p.level == nil or p.level == m.level) then
+              taken[pi] = true
+              own[#own + 1] = { personality = p.personality, species = m.species, hp = m.hp, max_hp = m.max_hp, slot = p.slot }
+              break
+            end
+          end
+        end
+      end
+    end
+    return { active = true, kind = st.kind, horde = st.horde or horde, foes = foes, own = own }
+  end
+
+  function self.encounters()
+    local out = {}
+    for i, e in ipairs(encounters) do out[i] = e end
+    return out
   end
 
   return self
@@ -1047,11 +1722,15 @@ __mod["gen6.personal"] = function(...)
 --           whose data validates as a personal table is used (see validate)
 --   entry : 0x50 bytes per species (PKHeX PersonalInfoORAS), index = Dex number
 --   growth: byte 0x15 of the entry (PersonalInfoORAS.EXPGrowth), values 0..5
--- Accepted shapes: one file with length % 0x50 == 0 and >= 722 entries, or
--- >= 722 files of 0x50 bytes (file species + 1 is the entry of that species).
+--   types : bytes 0x06 / 0x07 (Type1 / Type2, same value = single type)
+-- /a/1/9/5 is the confirmed ORAS path (pk3DS GARCReference); the LAST GARC file holds the whole
+-- table concatenated (pk3DS GameConfig). Accepted shapes: the last file (or the only one) with
+-- length % 0x50 == 0 and >= 722 entries, or >= 722 files of 0x50 bytes (file species + 1 is the
+-- entry of that species).
 local M = {}
 
 M.CANDIDATE_PATHS = { "/a/1/9/5", "/a/1/9/6" }
+M.TYPE_OFFSET = 0x06 -- Type1, Type2 follows
 M.ENTRY_SIZE = 0x50
 M.GROWTH_OFFSET = 0x15
 M.FORM_INDEX_OFFSET = 0x1C -- u16 FormStatsIndex (PKHeX PersonalInfoXY/ORAS), 0 = no extra forms
@@ -1066,6 +1745,7 @@ function M.new(fb, opts)
   local goff = opts.growth_offset or M.GROWTH_OFFSET
   local self = {}
   local rates, forms, attempts = nil, nil, 0
+  local whole_data, garc_data -- entry source: concatenated table, or the GARC itself
 
   local function form_info(e, out_forms, s)
     local idx = string.unpack("<I2", e, M.FORM_INDEX_OFFSET + 1)
@@ -1073,23 +1753,23 @@ function M.new(fb, opts)
     out_forms[s] = { index = idx, count = cnt }
   end
 
-  -- Returns a table species -> rate (1..721) and a table species -> {index, count},
-  -- or nil when data is not a personal table.
+  -- Returns a table species -> rate (1..721), a table species -> {index, count} and the source of
+  -- the entries ("whole", string | "files"), or nil when data is not a personal table.
   local function validate(data)
     local g = fb.codec.garc(data)
     if type(g) ~= "table" or type(g.count) ~= "number" then return nil end
     local out, fo = {}, {}
-    if g.count == 1 then
-      local whole = fb.codec.garc_file(data, 1, 1)
-      if type(whole) ~= "string" or #whole % esize ~= 0 or #whole // esize < M.MIN_ENTRIES then
-        return nil
-      end
+    local whole
+    local last = fb.codec.garc_file(data, g.count, 1)
+    if type(last) == "string" and #last % esize == 0 and #last // esize >= M.MIN_ENTRIES then whole = last end
+    if whole then
       for s = 1, M.MIN_ENTRIES - 1 do
         local r = whole:byte(s * esize + goff + 1)
         if not r or r > 5 then return nil end
         out[s] = r
         form_info(whole:sub(s * esize + 1, s * esize + esize), fo, s)
       end
+      return out, fo, whole
     elseif g.count >= M.MIN_ENTRIES then
       for s = 1, M.MIN_ENTRIES - 1 do
         local e = fb.codec.garc_file(data, s + 1, 1)
@@ -1099,10 +1779,9 @@ function M.new(fb, opts)
         out[s] = r
         form_info(e, fo, s)
       end
-    else
-      return nil
+      return out, fo, nil
     end
-    return out, fo
+    return nil
   end
 
   local function load()
@@ -1115,9 +1794,9 @@ function M.new(fb, opts)
     for _, path in ipairs(paths) do
       local data = fb.rom.romfs(path)
       if type(data) == "string" then
-        local r, fo = validate(data)
+        local r, fo, whole = validate(data)
         if r then
-          rates, forms = r, fo
+          rates, forms, whole_data, garc_data = r, fo, whole, data
           self.path = path
           if fb.log and fb.log.info then fb.log.info("personal data accepted at " .. path) end
           return true
@@ -1149,9 +1828,31 @@ function M.new(fb, opts)
     return f.index + form - 1
   end
 
+  -- Raw personal entry of a table index, or nil.
+  local function raw_entry(idx)
+    if whole_data then
+      local e = whole_data:sub(idx * esize + 1, idx * esize + esize)
+      return #e == esize and e or nil
+    end
+    local e = fb.codec.garc_file(garc_data, idx + 1, 1)
+    return (type(e) == "string" and #e == esize) and e or nil
+  end
+
+  -- { types = { t1, t2 }, growth } of a species form, or nil, "not_ready" | "unknown_species" | "no_form".
+  function self.info(species, form)
+    if math.type(species) ~= "integer" or species < 1 or species >= M.MIN_ENTRIES then
+      return nil, "unknown_species"
+    end
+    local idx, err = self.form_index(species, form)
+    if not idx then return nil, err end
+    local e = raw_entry(idx)
+    if not e then return nil, "no_form" end
+    return { types = { e:byte(M.TYPE_OFFSET + 1), e:byte(M.TYPE_OFFSET + 2) }, growth = e:byte(goff + 1) }
+  end
+
   -- Forget failures and cached values (e.g. after a game change).
   function self.reset()
-    rates, forms, attempts, self.path = nil, nil, 0, nil
+    rates, forms, whole_data, garc_data, attempts, self.path = nil, nil, nil, nil, 0, nil
   end
 
   return self
@@ -1276,6 +1977,506 @@ function M.parse(plain)
     }
   end
   return rec
+end
+
+return M
+
+end
+__mod["gen6.text"] = function(...)
+-- Game text of Omega Ruby / Alpha Sapphire, read at runtime from the player's own
+-- RomFS (gametext GARC) and kept in memory only. Nothing is shipped or cached.
+--
+-- Format (pk3DS TextFile.cs, see docs/games/omega-ruby-alpha-sapphire.md):
+--   header   : u16 sections, u16 line count, u32 total length, u32 initial key, u32 section data offset (SDO)
+--   at SDO   : u32 section length (== total length; SDO + total == file length)
+--   line tab : at SDO+4, 8 bytes per line: i32 offset (relative to SDO), i16 length (UTF-16 units), 2 pad
+--   line i   : UTF-16LE words, each xor key, key = rotl16(key, 3); key(i) = 0x7C89 + i * 0x2983 (16 bit)
+--   markup   : 0x0010 = variable (count, code, count-1 args); 0x0000 ends the line
+local M = {}
+
+M.GARC_BASE = 1 -- ORAS gametext of language index 0 is /a/0/7/1
+M.GARC_DIR = "/a/0/7/"
+M.KEY_BASE, M.KEY_ADVANCE, M.KEY_VARIABLE = 0x7C89, 0x2983, 0x0010
+
+-- gametext file index per name kind (ORAS, pk3DS TextReference.cs)
+M.FILES = { form = 5, move = 14, type = 18, ability = 37, nature = 51, location = 90, species = 98, item = 114 }
+M.KIND_ORDER = { "species", "move", "type", "ability", "nature", "location", "item", "form" }
+M.REQUIRED = { "species", "move" }
+M.MIN_ENTRIES = 115 -- the highest file index used is 114
+
+-- language code -> language indices to try (0 JA kana, 1 JA kanji, 2 EN, 3 FR, 4 IT, 5 DE, 6 ES, 7 KO)
+M.LANG_INDEX = { ja = { 1, 0 }, en = { 2 }, fr = { 3 }, it = { 4 }, de = { 5 }, es = { 6 }, ko = { 7 } }
+M.FALLBACK_STEPS = 300 -- steps to wait for the game language before falling back to EN
+
+local SPECIAL = { [0xE07F] = 0x202F, [0xE08D] = 0x2026, [0xE08E] = 0x2642, [0xE08F] = 0x2640 }
+
+-- Parses a text file. Returns { count = n, line = function(i) -> string|nil } (i is 0-based), or nil, reason.
+function M.parse(data)
+  if type(data) ~= "string" or #data < 0x14 then return nil, "too_short" end
+  local sections, count, total, _, sdo = string.unpack("<I2I2I4I4I4", data)
+  if sections < 1 or sdo < 0x10 or sdo + 4 > #data then return nil, "bad_header" end
+  if sdo + total ~= #data then return nil, "bad_length" end
+  if string.unpack("<I4", data, sdo + 1) ~= total then return nil, "bad_section" end
+  if sdo + 4 + count * 8 > #data then return nil, "bad_table" end
+  local file = { count = count }
+
+  function file.line(i)
+    if math.type(i) ~= "integer" or i < 0 or i >= count then return nil end
+    local off, len = string.unpack("<i4i2", data, sdo + 4 + i * 8 + 1)
+    if off < 0 or len < 0 then return nil end
+    local first = sdo + off + 1
+    if first + len * 2 - 1 > #data then return nil end
+    local key = (M.KEY_BASE + i * M.KEY_ADVANCE) & 0xFFFF
+    local out, n, p = {}, 0, first
+    local stop = first + len * 2
+    local function word()
+      if p + 1 > stop - 1 then return nil end
+      local w = string.unpack("<I2", data, p) ~ key
+      key = ((key << 3) | (key >> 13)) & 0xFFFF
+      p = p + 2
+      return w
+    end
+    while p < stop do
+      local w = word()
+      if w == nil or w == 0 then break end
+      if w == M.KEY_VARIABLE then
+        local cnt, code = word(), word()
+        if cnt == nil or code == nil then break end
+        local args = {}
+        for _ = 2, cnt do
+          local a = word()
+          if a == nil then break end
+          args[#args + 1] = a
+        end
+        if code == 0xBE00 then n = n + 1; out[n] = "\r"
+        elseif code == 0xBE01 then n = n + 1; out[n] = "\\c"
+        elseif code == 0xBE02 then n = n + 1; out[n] = "[WAIT]"
+        elseif code == 0xBDFF then -- empty-line marker, nothing to show
+        else n = n + 1; out[n] = string.format("[VAR %04X]", code) end
+      else
+        w = SPECIAL[w] or w
+        if w >= 0xD800 and w <= 0xDBFF and p < stop then
+          local lo = word()
+          if lo and lo >= 0xDC00 and lo <= 0xDFFF then
+            w = 0x10000 + ((w - 0xD800) << 10) + (lo - 0xDC00)
+          else
+            w = 0xFFFD
+          end
+        elseif w >= 0xD800 and w <= 0xDFFF then
+          w = 0xFFFD
+        end
+        n = n + 1
+        out[n] = utf8.char(w)
+      end
+    end
+    return table.concat(out)
+  end
+
+  return file
+end
+
+-- Store: finds the gametext GARC for the game language and loads the name files in bounded steps
+-- (one archive read or one file per step). Decoded lines are kept in memory only.
+-- opts.language_fn() -> language code or nil.
+function M.new(fb, opts)
+  opts = opts or {}
+  local self = {}
+  local codec = fb.codec
+  local can = fb.rom and fb.rom.romfs and codec and codec.garc and codec.garc_file and true or false
+  local state = can and "idle" or "unsupported" -- idle | open | fetch | done | unsupported
+  local files, lines = {}, {}
+  local cands, cand, data, kinds_left
+  local waited, fallback_used = 0, false
+
+  local function candidates(lang)
+    local out, seen = {}, {}
+    local function add(i) if not seen[i] then seen[i] = true; out[#out + 1] = i end end
+    for _, i in ipairs(M.LANG_INDEX[lang or ""] or {}) do add(i) end
+    add(2)
+    for i = 0, 7 do add(i) end
+    return out
+  end
+
+  local function begin(lang)
+    cands, cand, data = candidates(lang), 0, nil
+    files, lines = {}, {}
+    state = "open"
+  end
+
+  local function open_next()
+    cand = cand + 1
+    if cand > #cands then
+      state = "unsupported"
+      if fb.log and fb.log.warn then fb.log.warn("no readable game text archive found") end
+      return
+    end
+    local idx = cands[cand]
+    local d = fb.rom.romfs(M.GARC_DIR .. (M.GARC_BASE + idx))
+    if type(d) ~= "string" then return end
+    local ok, g = pcall(codec.garc, d)
+    if not ok or type(g) ~= "table" or type(g.count) ~= "number" or g.count < M.MIN_ENTRIES then return end
+    data = d
+    kinds_left = {}
+    for i, k in ipairs(M.KIND_ORDER) do kinds_left[i] = k end
+    files = {}
+    state = "fetch"
+    cands.current = idx
+  end
+
+  local function fetch_next()
+    local kind = table.remove(kinds_left, 1)
+    if kind then
+      local raw = codec.garc_file(data, M.FILES[kind] + 1, 1)
+      if type(raw) == "string" then
+        local f = M.parse(raw)
+        if f then files[kind] = f end
+      end
+    end
+    if #kinds_left == 0 then
+      for _, k in ipairs(M.REQUIRED) do
+        if not files[k] then -- not this language: try the next archive
+          data, files, state = nil, {}, "open"
+          return
+        end
+      end
+      data = nil
+      state = "done"
+      if fb.log and fb.log.info then fb.log.info("game text loaded, language index " .. tostring(cands.current)) end
+    end
+  end
+
+  local function advance()
+    if state == "idle" then
+      local lang = opts.language_fn and opts.language_fn() or nil
+      if lang == nil then
+        waited = waited + 1
+        if waited < M.FALLBACK_STEPS then return end
+        fallback_used = true
+      end
+      begin(lang)
+    elseif state == "open" then
+      open_next()
+    elseif state == "fetch" then
+      fetch_next()
+    elseif state == "done" and fallback_used then
+      -- loaded without knowing the language: reload once the real one is known
+      local lang = opts.language_fn and opts.language_fn() or nil
+      if lang ~= nil then fallback_used = false; begin(lang) end
+    end
+  end
+
+  -- One bounded step. Never raises.
+  function self.step()
+    if state == "unsupported" then return end
+    if state == "done" and not fallback_used then return end
+    local ok, err = pcall(advance)
+    if not ok then
+      state = "unsupported"
+      if fb.log and fb.log.error then fb.log.error("game text failed: " .. tostring(err)) end
+    end
+  end
+
+  function self.state() return state end
+  function self.ready() return state == "done" end
+  function self.language_index() return cands and cands.current end
+
+  -- Like name() but never advances the loading: the string, or nil when not loaded / unknown.
+  function self.peek(kind, id)
+    if state ~= "done" then return nil end
+    return (self.name(kind, id))
+  end
+
+  -- Name from the game text: string, or nil, "not_ready" | "unsupported" | "unknown_kind".
+  function self.name(kind, id)
+    if not M.FILES[kind] then return nil, "unknown_kind" end
+    if state == "unsupported" then return nil, "unsupported" end
+    if state ~= "done" then self.step(); return nil, "not_ready" end
+    if math.type(id) ~= "integer" then return nil end
+    local f = files[kind]
+    if not f then return nil end
+    local lk = lines[kind]
+    if not lk then lk = {}; lines[kind] = lk end
+    local v = lk[id]
+    if v == nil then
+      local ok, s = pcall(f.line, id)
+      v = (ok and type(s) == "string" and s ~= "") and s or false
+      lk[id] = v
+    end
+    return v or nil
+  end
+
+  return self
+end
+
+return M
+
+end
+__mod["gen6.zones"] = function(...)
+-- Zones and encounter areas of Omega Ruby / Alpha Sapphire, read at runtime from the player's
+-- own RomFS (encdata GARC /a/0/1/3). Entries are classified by content, not by index:
+-- first byte 0x11 = LZ11 (decompress); "ZO" mini pack = one zone; "EN" mini pack = encounter copy
+-- (ignored); no magic and size divisible by 0x38 = zonedata table.
+-- Formats: pk3DS RSWE.cs / OWSEStructs.cs / mini.cs (docs/games/omega-ruby-alpha-sapphire.md).
+-- Scanning is a step-wise state machine (a bounded batch of entries per step). Only derived
+-- numbers are kept, in memory; no names (names come from the game text).
+local M = {}
+
+M.GARC_PATH = "/a/0/1/3"
+M.ZONE_RECORD = 0x38
+M.LOCATION_OFFSET = 0x1C   -- u16, low 10 bits = location name index
+M.LOCATION_MASK = 0x3FF
+M.ENC_FILE = 4             -- ZO sub-file [3] (1-based 4) holds the wild encounters
+M.ENC_OFFSET = 0x0E        -- ORAS: slots start 0x0E into the sub-file
+M.ENC_MIN = 0xF6           -- ORAS: shorter than this means no encounter table
+M.ENC_BYTES = 0xF4         -- 61 slots x 4 bytes
+M.MAX_SPECIES = 721
+M.ENTRIES_PER_STEP = 8
+M.MAX_ENTRIES = 2000
+M.MAX_LZ_OUTPUT = 4 * 1024 * 1024
+
+-- slot groups in file order; horde A/B/C are merged into "horde"
+M.GROUPS = {
+  { "grass", 12 }, { "tall_grass", 12 }, { "swarm", 3 }, { "surf", 5 }, { "rock_smash", 5 },
+  { "old_rod", 3 }, { "good_rod", 3 }, { "super_rod", 3 }, { "horde", 5 }, { "horde", 5 }, { "horde", 5 },
+}
+
+-- Mini pack: 2-byte magic, u16 count, (count + 1) u32 offsets. Returns the sub-file list
+-- { {first, last}, ... } (1-based inclusive) or nil.
+function M.mini(data, magic)
+  if #data < 8 or data:sub(1, 2) ~= magic then return nil end
+  local count = string.unpack("<I2", data, 3)
+  if count > 64 or 4 + (count + 1) * 4 > #data then return nil end
+  local offs = {}
+  for i = 0, count do offs[i + 1] = string.unpack("<I4", data, 5 + i * 4) end
+  local subs = {}
+  for i = 1, count do
+    local a, b = offs[i], offs[i + 1]
+    if a > b or b > #data then return nil end
+    subs[i] = { a + 1, b }
+  end
+  return subs
+end
+
+-- 61 encounter slots from the raw 0xF4 bytes -> { grass = { {species, form, min, max}, ... }, ... }
+-- (identical entries removed). Returns the table and the number of valid slots.
+function M.decode_slots(raw)
+  local out, seen, n, pos = {}, {}, 0, 1
+  for _, g in ipairs(M.GROUPS) do
+    local name = g[1]
+    out[name] = out[name] or {}
+    seen[name] = seen[name] or {}
+    for _ = 1, g[2] do
+      local v, lo, hi = string.unpack("<I2I1I1", raw, pos)
+      pos = pos + 4
+      local species, form = v & 0x7FF, v >> 11
+      if species >= 1 and species <= M.MAX_SPECIES then
+        n = n + 1
+        local key = species .. ":" .. form .. ":" .. lo .. ":" .. hi
+        if not seen[name][key] then
+          seen[name][key] = true
+          out[name][#out[name] + 1] = { species = species, form = form, min = lo, max = hi }
+        end
+      end
+    end
+  end
+  return out, n
+end
+
+-- Classifies one decoded GARC entry. Returns "zo", rec0, enc_raw | "en" | "table", data | nil.
+function M.classify(d)
+  local magic = d:sub(1, 2)
+  if magic == "ZO" then
+    local subs = M.mini(d, "ZO")
+    if not subs then return nil end
+    local rec0, enc
+    local s0 = subs[1]
+    if s0 and s0[2] - s0[1] + 1 >= M.ZONE_RECORD then rec0 = d:sub(s0[1], s0[1] + M.ZONE_RECORD - 1) end
+    if #subs >= 4 then
+      local e = subs[M.ENC_FILE]
+      local start = e[1] + M.ENC_OFFSET
+      local stop = (subs[5] and subs[5][1] or (e[2] + 1)) -- offsets[4]: start of sub-file 5 or end
+      if stop - start >= M.ENC_MIN and start + M.ENC_BYTES - 1 <= #d then
+        enc = d:sub(start, start + M.ENC_BYTES - 1)
+      end
+    end
+    return "zo", rec0, enc
+  elseif magic == "EN" then
+    return "en"
+  elseif #d > 0 and #d % M.ZONE_RECORD == 0 then
+    return "table", d
+  end
+  return nil
+end
+
+local function location_of(rec)
+  if not rec or #rec < M.LOCATION_OFFSET + 2 then return nil end
+  return string.unpack("<I2", rec, M.LOCATION_OFFSET + 1) & M.LOCATION_MASK
+end
+
+-- env.name(kind, id) -> string or nil (optional, for names).
+function M.new(fb, env)
+  env = env or {}
+  local self = {}
+  local codec = fb.codec
+  local can = fb.rom and fb.rom.romfs and codec and codec.garc and codec.garc_file and true or false
+  local state = can and "idle" or "unsupported" -- idle | scan | done | unsupported
+  local data, count, nextidx = nil, 0, 1
+  local zos, table_data = {}, nil
+  local zones, area_list, last_zone = {}, {}, -1
+
+  local function open()
+    local d = fb.rom.romfs(M.GARC_PATH)
+    if type(d) ~= "string" then
+      state = "unsupported"
+      if fb.log and fb.log.warn then fb.log.warn("encounter data not found at " .. M.GARC_PATH) end
+      return
+    end
+    local ok, g = pcall(codec.garc, d)
+    if not ok or type(g) ~= "table" or type(g.count) ~= "number" or g.count < 1 then
+      state = "unsupported"
+      return
+    end
+    data, count, nextidx = d, math.min(g.count, M.MAX_ENTRIES), 1
+    state = "scan"
+  end
+
+  local function entry(i)
+    local e = codec.garc_file(data, i, 1)
+    if type(e) ~= "string" or #e == 0 then return nil end
+    if e:byte(1) == 0x11 and codec.lz_decompress then
+      local ok, out = pcall(codec.lz_decompress, e)
+      if not ok or type(out) ~= "string" or #out > M.MAX_LZ_OUTPUT then return nil end
+      e = out
+    end
+    return e
+  end
+
+  local function build()
+    -- zone id = GARC index (0-based); the ordinal among ZO packs is the alternative. The zonedata
+    -- table (record z belongs to zone z) tells which is right: ZO sub-file 1 is a copy of the record.
+    local function score(idof)
+      if not table_data then return 0 end
+      local ok = 0
+      for rank, z in ipairs(zos) do
+        local id = idof(rank, z)
+        local rec = table_data:sub(id * M.ZONE_RECORD + 1, (id + 1) * M.ZONE_RECORD)
+        if z.rec0 and #rec == M.ZONE_RECORD and rec == z.rec0 then ok = ok + 1 end
+      end
+      return ok
+    end
+    local by_index = function(_, z) return z.gi - 1 end
+    local by_rank = function(rank) return rank - 1 end
+    local idof, how = by_index, "garc index"
+    if table_data and score(by_rank) > score(by_index) then idof, how = by_rank, "ordinal" end
+    zones = {}
+    local max = -1
+    for rank, z in ipairs(zos) do
+      local id = idof(rank, z)
+      local loc
+      if table_data and (id + 1) * M.ZONE_RECORD <= #table_data then
+        loc = location_of(table_data:sub(id * M.ZONE_RECORD + 1, (id + 1) * M.ZONE_RECORD))
+      end
+      loc = loc or location_of(z.rec0)
+      zones[id] = { location = loc, enc = z.enc }
+      if id > max then max = id end
+    end
+    last_zone = max
+    -- areas: zones with at least one encounter slot, grouped by location name id in zone order
+    local by_loc, order = {}, {}
+    for id = 0, max do
+      local zi = zones[id]
+      if zi and zi.enc and zi.location then
+        local enc, n = M.decode_slots(zi.enc)
+        if n > 0 then
+          local a = by_loc[zi.location]
+          if not a then
+            a = { id = zi.location, zones = {}, encounters = {}, seen = {} }
+            by_loc[zi.location] = a
+            order[#order + 1] = a
+          end
+          a.zones[#a.zones + 1] = id
+          for kind, list in pairs(enc) do
+            local dst = a.encounters[kind]
+            if not dst and #list > 0 then dst = {}; a.encounters[kind] = dst; a.seen[kind] = {} end
+            for _, e in ipairs(list) do
+              local key = e.species .. ":" .. e.form .. ":" .. e.min .. ":" .. e.max
+              if not a.seen[kind][key] then a.seen[kind][key] = true; dst[#dst + 1] = e end
+            end
+          end
+        end
+      end
+    end
+    area_list = order
+    for _, a in ipairs(area_list) do a.seen = nil end
+    zos, table_data, data = {}, nil, nil
+    state = "done"
+    if fb.log and fb.log.info then
+      fb.log.info("zones scanned: " .. #area_list .. " areas, zone ids by " .. how)
+    end
+  end
+
+  local function advance()
+    if state == "idle" then open()
+    elseif state == "scan" then
+      local last = math.min(nextidx + M.ENTRIES_PER_STEP - 1, count)
+      for i = nextidx, last do
+        local e = entry(i)
+        if e then
+          local kind, a, b = M.classify(e)
+          if kind == "zo" then zos[#zos + 1] = { gi = i, rec0 = a, enc = b }
+          elseif kind == "table" and not table_data then table_data = a end
+        end
+      end
+      nextidx = last + 1
+      if nextidx > count then build() end
+    end
+  end
+
+  -- One bounded step. Never raises.
+  function self.step()
+    if state == "done" or state == "unsupported" then return end
+    local ok, err = pcall(advance)
+    if not ok then
+      state = "unsupported"
+      if fb.log and fb.log.error then fb.log.error("zone scan failed: " .. tostring(err)) end
+    end
+  end
+
+  function self.state() return state end
+  function self.found() return state == "done" and #area_list > 0 end
+
+  local function name_of(loc)
+    if env.name and loc then
+      local n = env.name("location", loc)
+      if type(n) == "string" then return n end
+    end
+    return nil
+  end
+
+  -- { zone, location, name } or nil, "not_ready" | "unsupported" | "unknown_zone"
+  function self.zone_info(zone, quiet)
+    if state == "unsupported" then return nil, "unsupported" end
+    if state ~= "done" then
+      if not quiet then self.step() end
+      return nil, "not_ready"
+    end
+    local z = math.type(zone) == "integer" and zones[zone] or nil
+    if not z or not z.location then return nil, "unknown_zone" end
+    return { zone = zone, location = z.location, name = name_of(z.location) }
+  end
+
+  -- List of { id, name, zones, encounters } in game order, or nil, "not_ready" | "unsupported"
+  function self.areas()
+    if state == "unsupported" then return nil, "unsupported" end
+    if state ~= "done" then self.step(); return nil, "not_ready" end
+    local out = {}
+    for i, a in ipairs(area_list) do
+      out[i] = { id = a.id, name = name_of(a.id), zones = a.zones, encounters = a.encounters }
+    end
+    return out
+  end
+
+  return self
 end
 
 return M

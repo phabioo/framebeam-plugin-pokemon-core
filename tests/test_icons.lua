@@ -4,7 +4,6 @@ local formats = require("formats")
 local crypto = require("pk6_crypto")
 local oras = require("gen6.oras")
 local icons = require("gen6.icons")
-local oras_location = require("gen6.oras_location")
 
 -- icon GARC: entry i+1 holds the icon with index i; first pixel red byte = i % 256
 local function icon_garc(count, w, h)
@@ -164,54 +163,4 @@ t.case("interface info reports icons only once found", function()
   run_until(a, function() return a:features().icons end)
   t.eq(api.info().features.icons, true)
   t.eq(api.icon(0), nil)
-end)
-
--- location
-
-local ZONE = 0x08C12340
-local function zone_mem(v) return { { addr = ZONE, data = string.pack("<I2", v) } } end
-
-t.case("location unsupported without any address", function()
-  local a = make()
-  t.eq({ a:location() }, { nil, "unsupported" })
-  t.eq(a:features().location, false)
-end)
-
-t.case("location from cache override address", function()
-  local a, mock = make({ cache = { ["config/zone_addr.txt"] = "0x08C12340\n" }, memory = zone_mem(0x0123) })
-  t.eq(a:location(), { zone = 0x123, source = "memory" })
-  t.eq(a:features().location, true)
-  t.eq(mock.watches["oras.zone"], { addr = ZONE, len = 2 })
-end)
-
-t.case("location not_ready when the address is not readable; bad override ignored", function()
-  local a = make({ cache = { ["config/zone_addr.txt"] = "08C12340" } })
-  t.eq({ a:location() }, { nil, "not_ready" })
-  local b = make({ cache = { ["config/zone_addr.txt"] = "banana" } })
-  t.eq({ b:location() }, { nil, "unsupported" })
-end)
-
-t.case("ZONE_ADDR table entry is used for the detected revision", function()
-  local build = require("pk6_build")
-  local REV2 = { party = 0x08CF727C }
-  oras_location.ZONE_ADDR.rev2 = ZONE
-  local ok, err = pcall(function()
-    local mem = zone_mem(77)
-    mem[#mem + 1] = { addr = REV2.party, data = build.encrypted({ species = 25, party = {} }) }
-    local a = make({ memory = mem })
-    t.eq({ a:location() }, { nil, "not_ready" }, "revision not yet known")
-    a:team()
-    t.eq(a:location(), { zone = 77, source = "memory" })
-    t.eq(a:features().location, true)
-  end)
-  oras_location.ZONE_ADDR.rev2 = nil
-  assert(ok, err)
-end)
-
-t.case("parse_addr", function()
-  t.eq(oras_location.parse_addr("0x10"), 16)
-  t.eq(oras_location.parse_addr(" 10 "), 16)
-  t.eq(oras_location.parse_addr("0"), nil)
-  t.eq(oras_location.parse_addr("123456789"), nil)
-  t.eq(oras_location.parse_addr(nil), nil)
 end)

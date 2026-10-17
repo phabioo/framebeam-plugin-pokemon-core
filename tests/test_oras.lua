@@ -4,36 +4,13 @@ local crypto = require("pk6_crypto")
 local build = require("pk6_build")
 local oras = require("gen6.oras")
 
-local REV2 = { party = 0x08CF727C, box = 0x08C9A144 }
-local REV01 = { party = 0x08CFB26C, box = 0x08C9E134 }
-local STRIDE, BOX_BYTES = 0x1E4, 31 * 30 * 232
+local mem = require("oras_mem")
+local addr = require("gen6.oras_addr")
 
-local function party_blob(slots)
-  local parts = {}
-  for i = 1, 6 do
-    local f = slots[i]
-    if f then
-      local c = {}
-      for k, v in pairs(f) do c[k] = v end
-      c.party = c.party or {}
-      f = c
-    end
-    local s = f and build.encrypted(f) or string.rep("\0", 260)
-    parts[i] = s .. string.rep("\0", STRIDE - 260)
-  end
-  return table.concat(parts)
-end
-
-local function box_blob(entries) -- entries[box][slot] = fields
-  local parts = {}
-  for b = 1, 31 do
-    for s = 1, 30 do
-      local f = entries[b] and entries[b][s]
-      parts[#parts + 1] = f and crypto.encrypt(build.build(f)) or string.rep("\0", 232)
-    end
-  end
-  return table.concat(parts)
-end
+local V10, V14 = mem.rev("v1.0").addr, mem.rev("v1.4").addr
+-- party + box in a revision (used by the older tests, same shape as before)
+local REV2 = { rev = "v1.0", party = V10.party, box = V10.box }
+local REV01 = { rev = "v1.4", party = V14.party, box = V14.box }
 
 local function codec()
   return { pk6_decrypt = crypto.decrypt }
@@ -41,10 +18,7 @@ end
 
 local function make(set, slots, boxes, extra)
   local memory = {}
-  if set then
-    memory[#memory + 1] = { addr = set.party, data = party_blob(slots or {}) }
-    memory[#memory + 1] = { addr = set.box, data = box_blob(boxes or {}) }
-  end
+  if set then memory = mem.world({ rev = set.rev, party = slots or {}, boxes = boxes or {} }) end
   local opts = { game = { system = "3ds", code = "000400000011C400" }, memory = memory, codec = codec(),
     i18n_dir = "plugin/i18n" }
   for k, v in pairs(extra or {}) do opts[k] = v end
@@ -53,27 +27,31 @@ local function make(set, slots, boxes, extra)
   return a, mock
 end
 
-t.case("watches both candidate sets", function()
-  local _, mock = make(REV2, { { species = 255, exp = 5 } })
-  local n = 0
-  for _ in pairs(mock.watches) do n = n + 1 end
-  t.eq(n, 4)
-  t.eq(mock.watches["oras.rev2.party"].addr, REV2.party)
-  t.eq(mock.watches["oras.rev0_1.box"].addr, REV01.box)
+t.case("watches both revision tables, the other one is released after detection", function()
+  local a, mock = make(REV2, { { species = 255, exp = 5 } })
+  t.eq(mock.watches["oras.v1.0.party"], { addr = V10.party, len = 6 * 0x1E4 })
+  t.eq(mock.watches["oras.v1.4.box"], { addr = V14.box, len = 31 * 30 * 232 })
+  t.eq(mock.watches["oras.v1.0.mystatus"].addr, V10.mystatus)
+  local total = 0
+  for _, w in pairs(mock.watches) do t.ok(w.len <= 4 * 1024 * 1024); total = total + w.len end
+  t.ok(total <= 16 * 1024 * 1024)
+  t.eq(a:revision(), "v1.0")
+  t.eq(mock.watches["oras.v1.4.party"], nil)
+  t.ok(mock.watches["oras.v1.0.party"] ~= nil)
 end)
 
-t.case("rev2 chosen", function()
+t.case("v1.0 chosen", function()
   local a = make(REV2, { { species = 255, exp = 5, nickname = "Colonel" } })
-  t.eq(a:revision(), "rev2")
+  t.eq(a:revision(), "v1.0")
   local team = a:team()
   t.eq(#team, 1)
   t.eq(team[1].species, 255); t.eq(team[1].slot, 1); t.eq(team[1].nickname, "Colonel")
   t.eq(team[1].level, nil)
 end)
 
-t.case("rev0_1 chosen", function()
+t.case("v1.4 chosen", function()
   local a = make(REV01, { { species = 7, exp = 5 } })
-  t.eq(a:revision(), "rev0_1")
+  t.eq(a:revision(), "v1.4")
   t.eq(a:team()[1].species, 7)
   t.eq(a:box_count(), 31)
 end)
@@ -207,4 +185,254 @@ t.case("language heuristic", function()
   local c = make(REV2, { { origin_game = 24, language_id = 5 }, { species = 4, origin_game = 44, language_id = 2 } })
   t.eq(c:language(), nil)
   t.eq(make(nil):language(), nil)
+end)
+
+-- ---------------------------------------------------------------------------------------------
+-- live party stats, trainer, badges, overrides, location, names (v0.3)
+
+local tb = require("text_build")
+local formats = require("formats")
+
+local function world_make(o, extra)
+  local opts = { game = { system = "3ds", code = "000400000011C400" }, memory = mem.world(o), codec = codec(),
+    i18n_dir = "plugin/i18n" }
+  for k, v in pairs(extra or {}) do opts[k] = v end
+  local mock = fb_mock.new(opts)
+  local a = oras.attach({ fb = mock.fb, game = { id = "pokemon_omega_ruby" }, detected = {} })
+  return a, mock
+end
+
+local function ticks(a, n) for _ = 1, n do a:tick() end end
+
+t.case("live stats are decoded from the second stream at +0x158", function()
+  local a = world_make({ party = {
+    { species = 25, exp = 100, party = { level = 37, hp = 55, max_hp = 102, status = 0x0A, stats = { atk = 60 } } },
+    { species = 4, exp = 100, ec = 0x00ABCDEF, party = { level = 5, hp = 1, max_hp = 1 } },
+  } })
+  local team = a:team()
+  t.eq({ team[1].level, team[1].hp, team[1].max_hp, team[1].status }, { 37, 55, 102, 0x0A })
+  t.eq({ team[2].level, team[2].hp, team[2].max_hp }, { 5, 1, 1 })
+  t.eq(team[1].party_ext, nil)
+  t.eq(a:features().live_stats, true)
+end)
+
+t.case("insane or missing live stats fall back to the level from EXP", function()
+  local g = require("gen6.growth")
+  local c = personal_stubs("single")
+  local a = world_make({ party = {
+    { species = 255, exp = g.exp_for_level(3, 8) + 1, party = { level = 50, hp = 200, max_hp = 100 } }, -- hp > max
+    { species = 255, exp = g.exp_for_level(3, 8) + 1, party = { level = 101, hp = 1, max_hp = 1 } },
+    { species = 255, exp = g.exp_for_level(3, 8) + 1, party = { level = 5, hp = 0, max_hp = 0 } },
+    { species = 255, exp = g.exp_for_level(3, 8) + 1, party = { level = 5, hp = 5, max_hp = 5, stats = { spd = 0 } } },
+  } }, { codec = c, romfs = { ["/a/1/9/5"] = "valid" } })
+  local team = a:team()
+  t.eq(#team, 4)
+  for i = 1, 4 do
+    t.eq(team[i].level, 8, "slot " .. i)
+    t.eq(team[i].hp, nil); t.eq(team[i].max_hp, nil); t.eq(team[i].status, nil)
+  end
+  t.eq(a:features().live_stats, false)
+  -- an all-zero stats area decrypts to garbage and must not pass
+  local mockmem = mem.world({ party = { { species = 255, exp = 1 } } })
+  mem.poke(mockmem, V10.party + 0x158, string.rep("\0", 22))
+  local b = oras.attach({ fb = fb_mock.new({ memory = mockmem, codec = codec(), i18n_dir = "plugin/i18n" }).fb })
+  t.eq(b:team()[1].level, nil)
+end)
+
+local TRAINER = { tid = 1111, sid = 2222, version = 27, language_id = 5, name = "Rubin" }
+
+t.case("trainer, badges, money, play time and language from MyStatus (v1.0 and v1.4)", function()
+  for _, rev in ipairs({ "v1.0", "v1.4" }) do
+    local a = world_make({ rev = rev, party = { { species = 25 } }, trainer = TRAINER,
+      misc = { money = 12345, badges = 0x15 }, play_time = { h = 123, m = 34, s = 56 } })
+    t.eq(a:trainer(), { name = "Rubin", tid = 1111, sid = 2222, version = 27, language = "de", money = 12345, badges = 3,
+      play_time = { h = 123, m = 34, s = 56 } }, rev)
+    local b = a:badges()
+    t.eq(b.count, 3)
+    t.eq(b.flags, { true, false, true, false, true, false, false, false })
+    t.eq(a:language(), "de")
+  end
+end)
+
+t.case("trainer needs a readable MyStatus; implausible money and play time are left out", function()
+  local a = world_make({ party = { { species = 25 } } })
+  t.eq({ a:trainer() }, { nil, "not_ready" })
+  t.eq({ a:badges() }, { nil, "not_ready" })
+  local b = world_make({ party = { { species = 25 } }, trainer = TRAINER, misc = { money = 5000000, badges = 255 },
+    play_time = { h = 1, m = 61, s = 1 } })
+  local tr = b:trainer()
+  t.eq(tr.money, nil); t.eq(tr.play_time, nil); t.eq(tr.badges, 8)
+  local c = world_make({ trainer = TRAINER })
+  t.eq({ c:trainer() }, { nil, "not_ready" }, "no revision yet")
+  t.eq({ c:badges() }, { nil, "not_ready" })
+end)
+
+t.case("language falls back to the party heuristic without MyStatus", function()
+  local a = world_make({ party = { { tid = 11, sid = 22, origin_game = 27, language_id = 5 } } })
+  t.eq(a:language(), "de")
+end)
+
+local function warnings(mock, pat)
+  local n = 0
+  for _, l in ipairs(mock.logs) do if l.level == "warn" and l.text:find(pat, 1, true) then n = n + 1 end end
+  return n
+end
+
+t.case("cross-check: MyStatus TID against own-origin party members", function()
+  local a, mock = world_make({ party = { { tid = 1111, sid = 2222, origin_game = 27 } }, trainer = TRAINER })
+  a:team(); a:team()
+  t.eq(warnings(mock, "cross-check"), 0)
+  local b, mock2 = world_make({ party = { { tid = 4, sid = 2222, origin_game = 27 }, { tid = 1111, origin_game = 44 } },
+    trainer = TRAINER })
+  b:team(); b:team()
+  t.eq(warnings(mock2, "cross-check"), 1)
+  -- nothing to compare yet (only foreign-origin members): no verdict, no warning
+  local c, mock3 = world_make({ party = { { tid = 4, origin_game = 44 } }, trainer = TRAINER })
+  c:team()
+  t.eq(warnings(mock3, "cross-check"), 0)
+end)
+
+t.case("address overrides: generic, per revision, bad lines, zone_addr.txt", function()
+  local ov = addr.parse_overrides("party=0x08000000\nv1.4.misc = 08111110\n# comment\nbogus=1\nmystatus=zzz\nv9.9.party=0x1\nmap_id=0x08222220 # c\n\nbox")
+  t.eq(ov.generic, { party = 0x08000000, map_id = 0x08222220 })
+  t.eq(ov.rev, { ["v1.4"] = { misc = 0x08111110 } })
+  t.eq(#ov.bad, 4)
+  local good = addr.resolve(mem.rev("v1.4"), ov)
+  t.eq(good.party, 0x08000000); t.eq(good.misc, 0x08111110); t.eq(good.box, V14.box)
+  t.eq(addr.resolve(mem.rev("v1.0"), ov).misc, V10.misc)
+
+  -- the party is found at the overridden address; watches follow
+  local m = mem.world({ party = { { species = 25 } } })
+  m[1].addr = 0x08000000
+  local mock = fb_mock.new({ memory = m, codec = codec(), i18n_dir = "plugin/i18n",
+    cache = { ["config/addresses.txt"] = "party=0x08000000\nnonsense\n", ["config/zone_addr.txt"] = "0x08123450" } })
+  local a = oras.attach({ fb = mock.fb })
+  t.eq(a:revision(), "v1.0")
+  t.eq(mock.watches["oras.v1.0.party"].addr, 0x08000000)
+  t.eq(mock.watches["oras.v1.4.party"], nil) -- released after detection
+  t.eq(mock.watches["oras.v1.0.map_id"].addr, 0x08123450)
+  t.eq(warnings(mock, "nonsense"), 1)
+  -- zone_addr.txt wins over map_id= in addresses.txt
+  local both = addr.load_overrides(fb_mock.new({ i18n_dir = "plugin/i18n", cache = {
+    ["config/addresses.txt"] = "map_id=0x08222220", ["config/zone_addr.txt"] = "0x08123450" } }).fb)
+  t.eq(both.generic.map_id, 0x08123450)
+  t.eq(addr.parse_addr("0x10"), 16)
+  t.eq(addr.parse_addr("0"), nil)
+  t.eq(addr.parse_addr("123456789"), nil)
+  t.eq(addr.parse_addr(nil), nil)
+end)
+
+t.case("every address key has a length and the v1.4 save range is v1.0 + 0x3FF0", function()
+  for _, key in ipairs({ "party", "box", "mystatus", "misc", "play_time", "map_id", "player_x", "player_y", "event_flags" }) do
+    t.eq(V14[key] - V10[key], addr.SHIFT, key)
+  end
+  for _, key in ipairs(addr.KEYS) do t.ok(addr.LENGTHS[key] > 0) end
+  t.eq(V10.battle_flag, nil) -- no known v1.0 in-battle flag
+end)
+
+-- zone world: zone 0 = route (loc 10), zone 1 = town (loc 20)
+local function zr(loc) return string.rep("\0", 0x1C) .. string.pack("<I2", loc) .. string.rep("\0", 0x38 - 0x1E) end
+local function mini(magic, subs)
+  local n = #subs
+  local off, offs, body = 4 + (n + 1) * 4, {}, {}
+  for i = 1, n do offs[i] = string.pack("<I4", off); body[i] = subs[i]; off = off + #subs[i] end
+  return magic .. string.pack("<I2", n) .. table.concat(offs) .. string.pack("<I4", off) .. table.concat(body)
+end
+local function zo(loc)
+  local slots = string.pack("<I2I1I1", 25, 3, 5) .. string.rep("\0", 0xF4 - 4)
+  return mini("ZO", { zr(loc), "e", "s", string.rep("\1", 0x0E) .. slots .. "\0\0", "u" })
+end
+
+local function text_world()
+  local function lines(prefix, n) local l = {} for i = 0, n - 1 do l[#l + 1] = prefix .. i end return l end
+  local gt = tb.garc({ [98] = tb.build(lines("Sp", 30)), [14] = tb.build(lines("Mv", 10)), [90] = tb.build(lines("Loc", 40)) })
+  return {
+    ["/a/0/7/6"] = gt, -- German
+    ["/a/0/1/3"] = formats.garc({ zo(10), mini("ZO", { zr(20), "a", "b" }), mini("EN", { "x" }) }),
+  }
+end
+
+t.case("location with names: zone, location id, name, position, event on change", function()
+  local a, mock = world_make({ party = { { species = 25 } }, trainer = TRAINER, zone = 0, x = 1.5, y = -2.25 },
+    { romfs = text_world(), codec = (function() local c = formats.fake_codec(); c.pk6_decrypt = crypto.decrypt; return c end)() })
+  local l = a:location()
+  t.eq(l, { zone = 0, source = "memory", x = 1.5, y = -2.25 }, "before the zone scan")
+  ticks(a, 400)
+  l = a:location()
+  t.eq(l, { zone = 0, location = 10, name = "Loc10", x = 1.5, y = -2.25, source = "memory" })
+  t.eq(a:zone_info(1), { zone = 1, location = 20, name = "Loc20" })
+  t.eq(a:name("species", 7), "Sp7")
+  t.eq(a:features().names, true); t.eq(a:features().areas, true); t.eq(a:features().location, true)
+  local areas = a:areas()
+  t.eq(#areas, 1); t.eq(areas[1].id, 10); t.eq(areas[1].name, "Loc10"); t.eq(areas[1].zones, { 0 })
+  t.eq(a:team()[1].species_name, "Sp25")
+  local events = {}
+  for _, e in ipairs(mock.events) do if e.name == "location.changed" then events[#events + 1] = e.value end end
+  t.eq(#events, 3) -- first sight (zone only), then with the location id, then with the name
+  t.eq(events[1].location, nil); t.eq(events[2].location, 10); t.eq(events[2].name, nil)
+  t.eq(events[3].name, "Loc10")
+  mem.poke(mock.regions, V10.map_id, string.pack("<I2", 1))
+  ticks(a, 3)
+  events = {}
+  for _, e in ipairs(mock.events) do if e.name == "location.changed" then events[#events + 1] = e.value end end
+  t.eq(#events, 4)
+  t.eq(events[4].zone, 1); t.eq(events[4].location, 20); t.eq(events[4].name, "Loc20")
+end)
+
+t.case("location: unsupported/not_ready cases", function()
+  local a = world_make({})
+  t.eq({ a:location() }, { nil, "not_ready" })
+  local c = formats.fake_codec(); c.pk6_decrypt = crypto.decrypt
+  local b = world_make({ party = { { species = 25 } } }, { codec = c })
+  t.eq({ b:location() }, { nil, "not_ready" }, "map id not readable")
+  t.eq({ b:name("species", 1) }, { nil, "not_ready" })
+  t.eq({ b:areas() }, { nil, "not_ready" })
+  t.eq({ b:zone_info(1) }, { nil, "unsupported" }, "the first call already found no encounter archive")
+end)
+
+-- personal GARC with types: entry s has types (s % 18, s * 7 % 18), growth s % 6; the last file is the
+-- whole table; species 25 has 3 forms at table indices 722..724
+local function personal_with_types()
+  local function entry(s, t1, t2, gr, fidx, fcount)
+    local e = {}
+    for i = 1, 0x50 do e[i] = "\0" end
+    e[0x06 + 1], e[0x07 + 1], e[0x15 + 1] = string.char(t1), string.char(t2), string.char(gr)
+    if fidx then
+      e[0x1C + 1], e[0x1C + 2] = string.char(fidx & 255), string.char(fidx >> 8)
+      e[0x20 + 1] = string.char(fcount)
+    end
+    return table.concat(e)
+  end
+  local list = {}
+  for s = 0, 721 do list[s + 1] = entry(s, s % 18, (s * 7) % 18, s % 6, s == 25 and 722 or nil, s == 25 and 3 or nil) end
+  list[723] = entry(722, 5, 5, 0); list[724] = entry(723, 6, 6, 0); list[725] = entry(724, 7, 8, 0)
+  local files = {}
+  for i = 1, #list do files[i] = list[i] end
+  files[#files + 1] = table.concat(list)
+  return formats.garc(files)
+end
+
+t.case("species_info from the personal table (last file holds everything)", function()
+  local c = formats.fake_codec(); c.pk6_decrypt = crypto.decrypt
+  local a = world_make({ party = { { species = 25 } } }, { romfs = { ["/a/1/9/5"] = personal_with_types() }, codec = c })
+  t.eq(a:species_info(25, 0), { types = { 7, 13 }, growth = 1 })
+  t.eq(a:species_info(25), { types = { 7, 13 }, growth = 1 })
+  t.eq(a:species_info(25, 1), { types = { 5, 5 }, growth = 0 })
+  t.eq(a:species_info(25, 3), nil, "form beyond FormeCount")
+  t.eq({ a:species_info(800, 0) }, { nil, "unknown_species" })
+  t.eq({ a:species_info(25, 3) }, { nil, "no_form" })
+  local b = world_make({ party = { { species = 25 } } })
+  t.eq({ b:species_info(25, 0) }, { nil, "not_ready" })
+end)
+
+t.case("event flags are bits of the flag block", function()
+  local a, mock = world_make({ party = { { species = 25 } }, extra = nil })
+  t.eq(a:event_flag(0), nil)
+  local b = oras.attach({ fb = fb_mock.new({ memory = (function()
+    local m = mem.world({ party = { { species = 25 } } })
+    m[#m + 1] = { addr = V10.event_flags, data = "\5" .. string.rep("\0", 0x19F) }
+    return m
+  end)(), codec = codec(), i18n_dir = "plugin/i18n" }).fb })
+  t.eq(b:event_flag(0), true); t.eq(b:event_flag(1), false); t.eq(b:event_flag(2), true)
+  t.eq(b:event_flag(0xD00), nil)
 end)

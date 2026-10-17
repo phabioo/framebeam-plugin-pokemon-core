@@ -59,6 +59,8 @@ function M.build(f)
     b[0xEC] = f.party.level or 0
     put(0xF0, "<I2", f.party.hp or 0)
     put(0xF2, "<I2", f.party.max_hp or 0)
+    local st = f.party.stats or {}
+    for i, k in ipairs({ "atk", "def", "spe", "spa", "spd" }) do put(0xF4 + (i - 1) * 2, "<I2", st[k] or 50) end
   end
   local parts = {}
   for i = 0, size - 1 do parts[#parts + 1] = string.char(b[i]) end
@@ -70,5 +72,15 @@ function M.build(f)
 end
 
 function M.encrypted(f) return crypto.encrypt(M.build(f)) end
+
+-- A party slot as laid out in RAM (0x1E4 bytes): the encrypted 0xE8 bytes at +0, the 22 encrypted
+-- party-stat bytes at +0x158 (invented layout position copied from the documented RAM layout).
+function M.ram_slot(f)
+  local g = {}
+  for k, v in pairs(f) do g[k] = v end
+  g.party = g.party or {}
+  local enc = crypto.encrypt(M.build(g))
+  return enc:sub(1, 232) .. string.rep("\0", 0x158 - 232) .. enc:sub(233, 254) .. string.rep("\0", 0x1E4 - 0x16E)
+end
 
 return M

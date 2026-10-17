@@ -8,6 +8,9 @@ gen6.personal
 gen6.pk6
 main
 gen6.icons
-gen6.oras_location
+gen6.oras_addr
+gen6.oras_battle
+gen6.text
+gen6.zones
 gen6.darc
 gen6.maps

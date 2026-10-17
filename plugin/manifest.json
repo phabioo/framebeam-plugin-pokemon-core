@@ -1,7 +1,7 @@
 {
   "id": "net.framebeam.pokemon-core",
   "name": "Pokémon Core",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "api": 1,
   "type": "script",
   "provides": ["pokemon.core"],

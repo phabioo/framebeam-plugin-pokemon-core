@@ -199,3 +199,75 @@ t.case("adapter exposes map methods and feature after ticks", function()
   t.eq(#a:map_candidates(), 4)
   t.eq(a:map_selected(), nil)
 end)
+
+-- noise filter and archive priority (v0.3)
+
+local function noise_rgba(w, h)
+  local seed, out = 12345, {}
+  for i = 1, w * h do
+    local px = {}
+    for c = 1, 3 do
+      seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+      px[c] = string.char((seed >> 16) & 0xFF)
+    end
+    out[i] = table.concat(px) .. "\255"
+  end
+  return table.concat(out)
+end
+
+local function gradient_rgba(w, h)
+  local out = {}
+  for y = 0, h - 1 do
+    for x = 0, w - 1 do out[#out + 1] = string.char(x * 255 // w, y * 255 // h, 128, 255) end
+  end
+  return table.concat(out)
+end
+
+t.case("noisy: random pixels are noise, smooth images and tiny samples are not", function()
+  t.eq(maps.noisy({ width = 256, height = 128, rgba = noise_rgba(256, 128) }), true)
+  t.eq(maps.noisy({ width = 256, height = 128, rgba = gradient_rgba(256, 128) }), false)
+  t.eq(maps.noisy({ width = 256, height = 128, rgba = string.rep("\0\0\0\255", 256 * 128) }), false)
+  t.eq(maps.noisy({ width = 256, height = 128, rgba = string.rep("\255\0\0\0", 256 * 128) }), false, "fully transparent")
+  t.eq(maps.noisy({ width = 4, height = 4, rgba = noise_rgba(4, 4) }), false, "too few pairs to judge")
+  t.eq(maps.noisy(nil), false)
+  t.eq(maps.noisy({ width = 256, height = 128, rgba = "short" }), false)
+end)
+
+t.case("the scan drops noisy candidates (also inside LZ and DARC) and keeps the others", function()
+  local r = {
+    ["/a/0/0/0"] = formats.garc({
+      formats.bclim(300, 200, noise_rgba(300, 200)),                                   -- 1: garbage
+      formats.bclim(300, 200, gradient_rgba(300, 200)),                                -- 2: real-looking
+      formats.lz11_literal(formats.bclim(256, 128, noise_rgba(256, 128))),             -- 3: garbage, LZ
+      formats.darc({ { path = "timg/n.bclim", data = formats.bclim(256, 128, noise_rgba(256, 128)) },
+        { path = "timg/g.bclim", data = formats.bclim(256, 130, gradient_rgba(256, 130)) } }), -- 4
+    }),
+  }
+  local store = make({ romfs = r })
+  t.ok(finish(store))
+  local ids = {}
+  for _, c in ipairs(store.candidates()) do ids[#ids + 1] = c.id end
+  table.sort(ids)
+  t.eq(ids, { "/a/0/0/0#2", "/a/0/0/0#4/timg/g.bclim" })
+end)
+
+t.case("undecodable candidates are kept (only proven garbage is dropped)", function()
+  local c = formats.fake_codec()
+  c.bclim = function() return nil, "unsupported" end
+  local store = make({ romfs = { ["/a/0/0/1"] = formats.bclim(400, 300) }, codec = c })
+  t.ok(finish(store))
+  t.eq(#store.candidates(), 1)
+end)
+
+t.case("the forum-listed town map archives are scanned first", function()
+  local r = world()
+  r["/a/0/6/8"] = formats.garc({ formats.bclim(512, 256) })
+  r["/a/2/4/8"] = formats.garc({ formats.bclim(256, 256) })
+  r["/a/2/7/6"] = formats.garc({ formats.bclim(300, 256) })
+  r["/a/0/6/7"] = formats.garc({ formats.bclim(400, 256) })
+  local store, _, reads = make({ romfs = r })
+  t.ok(finish(store))
+  t.eq({ reads[1], reads[2], reads[3], reads[4] }, { "/a/0/6/7", "/a/0/6/8", "/a/2/4/8", "/a/2/7/6" })
+  t.eq(reads[5], "/a/0/0/0")
+  t.eq(#store.candidates() >= 4, true)
+end)
