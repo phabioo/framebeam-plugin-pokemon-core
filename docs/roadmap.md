@@ -1,6 +1,6 @@
 # Roadmap
 
-Status: in progress: skeleton and ORAS adapter; v0.3.0 delivers live team stats, trainer/badges/money, location with names, encounter areas, battle state, wild encounters and names from the game text for Omega Ruby / Alpha Sapphire (v1.0 and v1.4); real-game verification of the derived and battle addresses is open (`docs/games/omega-ruby-alpha-sapphire.md`). Depends on FrameBeam plugin API v1 (0.11, planned); see https://github.com/phabioo/framebeam `docs/roadmap.md`.
+Status: in progress: skeleton and ORAS adapter; v0.3.1 (v0.3.0 plus fixes for zones and species names, and `locations()`) delivers live team stats, trainer/badges/money, location with names, encounter areas, battle state, wild encounters and names from the game text for Omega Ruby / Alpha Sapphire (v1.0 and v1.4); real-game verification of the derived and battle addresses is open (`docs/games/omega-ruby-alpha-sapphire.md`). Depends on FrameBeam plugin API v1 (0.11, planned); see https://github.com/phabioo/framebeam `docs/roadmap.md`.
 
 ## v0.1 Omega Ruby / Alpha Sapphire (3DS, Gen 6)
 
@@ -10,7 +10,9 @@ Status: in progress: skeleton and ORAS adapter; v0.3.0 delivers live team stats,
 - Location/route table keyed by internal IDs, with self-recorded map coordinates; `provides` interface for other plugins.
 - Offsets documented per game in `docs/games/<game>.md`; verified locally by the maintainer with the FrameBeam developer mode.
 
-### Status v0.3.0 (ORAS)
+### Status v0.3.1 (ORAS)
+
+- v0.3.1: lenient ZO pack parsing (a bad offset no longer drops the pack), table-only zones, `locations()` (all places, towns included), the archive open is retried, species list found by content when file 98 is implausible, `species_name` on encounter records/events, diagnostics log lines (counts only). Real-game confirmation of the two fixed bugs is open.
 
 - Done in code (synthetic tests): revisions v1.0/v1.4 with address overrides, live party stats, trainer/badges/money/play time, game text names, zones and encounter areas, `species_info`, battle/encounter tracking with events, region map scan with priority archives and noise filter.
 - Open: verification on a real v1.0 game of the derived and battle addresses (Fabio), Alpha Sapphire, a non-guessed map coordinate table for the region map, encounter type detection (not in RAM).

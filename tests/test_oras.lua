@@ -387,7 +387,9 @@ t.case("location: unsupported/not_ready cases", function()
   t.eq({ b:location() }, { nil, "not_ready" }, "map id not readable")
   t.eq({ b:name("species", 1) }, { nil, "not_ready" })
   t.eq({ b:areas() }, { nil, "not_ready" })
-  t.eq({ b:zone_info(1) }, { nil, "unsupported" }, "the first call already found no encounter archive")
+  t.eq({ b:zone_info(1) }, { nil, "not_ready" }, "the archive is retried a few times")
+  for _ = 1, 25 do b:zone_info(1) end
+  t.eq({ b:zone_info(1) }, { nil, "unsupported" }, "then no encounter archive is final")
 end)
 
 -- personal GARC with types: entry s has types (s % 18, s * 7 % 18), growth s % 6; the last file is the
@@ -435,4 +437,16 @@ t.case("event flags are bits of the flag block", function()
   end)(), codec = codec(), i18n_dir = "plugin/i18n" }).fb })
   t.eq(b:event_flag(0), true); t.eq(b:event_flag(1), false); t.eq(b:event_flag(2), true)
   t.eq(b:event_flag(0xD00), nil)
+end)
+
+t.case("v0.3.1: species names in team and encounter records, locations() through the adapter", function()
+  local a, mock = world_make({ party = { { species = 25 } }, trainer = TRAINER, zone = 0 },
+    { romfs = text_world(), codec = (function() local c = formats.fake_codec(); c.pk6_decrypt = crypto.decrypt; return c end)() })
+  t.eq({ a:locations() }, { nil, "not_ready" })
+  ticks(a, 400)
+  t.eq(a:team()[1].species_name, "Sp25")
+  local locs = a:locations()
+  t.eq(#locs, 2); t.eq(locs[1].id, 10); t.eq(locs[1].has_encounters, true); t.eq(locs[2].id, 20); t.eq(locs[2].has_encounters, false)
+  t.eq(locs[2].name, "Loc20")
+  t.eq(a:features().locations, true)
 end)
