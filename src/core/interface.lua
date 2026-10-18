@@ -2,11 +2,11 @@
 local M = {}
 
 local METHODS = { "team", "box", "box_count", "location", "battle", "encounters", "badges", "trainer", "name",
-  "species_info", "areas", "locations", "zone_info", "icon", "map_candidates", "map_image", "map_selected" }
+  "species_info", "areas", "locations", "zone_info", "icon", "map_candidates", "map_image", "map_selected", "diagnostics" }
 local FEATURE = {
   team = "team", box = "box", location = "location",
   battle = "battle", encounters = "encounters", badges = "badges", trainer = "trainer", name = "names",
-  areas = "areas", locations = "locations", icon = "icons", map_candidates = "map",
+  areas = "areas", locations = "locations", icon = "icons", map_candidates = "map", diagnostics = "diagnostics",
 }
 
 local function has(adapter, name)

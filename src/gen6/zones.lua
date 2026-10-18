@@ -22,6 +22,8 @@ M.MAX_SPECIES = 721
 M.ENTRIES_PER_STEP = 8
 M.MAX_ENTRIES = 2000
 M.MAX_LZ_OUTPUT = 4 * 1024 * 1024
+M.RETRY_EVERY = 25         -- steps between retries after a failure (state "failed")
+M.MAX_RETRIES = 40         -- retries before the state becomes "unsupported" for good
 
 -- slot groups in file order; horde A/B/C are merged into "horde"
 M.GROUPS = {
@@ -116,17 +118,22 @@ local function location_of(rec)
 end
 
 -- env.name(kind, id) -> string or nil (optional, for names).
+-- env.names_state() -> state of the game text store (optional): while it is neither "done" nor
+-- "unsupported", areas() and locations() answer "not_ready", so a list is never handed out (and cached
+-- by a consumer) without names that are only a few steps away.
 function M.new(fb, env)
   env = env or {}
   local self = {}
   local codec = fb.codec
   local can = fb.rom and fb.rom.romfs and codec and codec.garc and codec.garc_file and true or false
-  local state = can and "idle" or "unsupported" -- idle | scan | done | unsupported
+  local state = can and "idle" or "unsupported" -- idle | scan | done | failed (retrying) | unsupported
   local data, count, nextidx = nil, 0, 1
   local zos, table_data = {}, nil
   local zones, area_list, loc_list, last_zone = {}, {}, {}, -1
   local open_tries = 0
   local first_reason, ngarc = nil, 0
+  local fails, wait = 0, 0
+  local diag = { zo_packs = 0, with_enc = 0, table_zones = 0, how = "none" }
 
   local function log(level, msg)
     if fb.log and fb.log[level] then fb.log[level](msg) end
@@ -136,20 +143,33 @@ function M.new(fb, env)
     if r and not first_reason then first_reason = r end
   end
 
+  -- A failure is not final: the archive may only become readable later (the ROM is mounted late)
+  -- and a consumer treats "unsupported" as permanent. Retry slowly, give up after MAX_RETRIES.
+  local function fail(reason, msg)
+    note_reason(reason)
+    fails = fails + 1
+    data, zos, table_data = nil, {}, nil
+    if fails > M.MAX_RETRIES then
+      state = "unsupported"
+      log("warn", msg .. "; giving up")
+    else
+      state, wait = "failed", M.RETRY_EVERY
+      if fails == 1 then log("warn", msg .. "; retrying") end
+    end
+  end
+
   local function open()
     open_tries = open_tries + 1
     local d = fb.rom.romfs(M.GARC_PATH)
     if type(d) ~= "string" then
       if open_tries >= M.OPEN_RETRIES then
-        state = "unsupported"
-        log("warn", "encounter data not found at " .. M.GARC_PATH)
+        fail("archive_missing", "encounter data not found at " .. M.GARC_PATH)
       end
       return
     end
     local ok, g = pcall(codec.garc, d)
     if not ok or type(g) ~= "table" or type(g.count) ~= "number" or g.count < 1 then
-      state = "unsupported"
-      log("warn", "encounter data at " .. M.GARC_PATH .. " is not a readable GARC")
+      fail("archive_unreadable", "encounter data at " .. M.GARC_PATH .. " is not a readable GARC")
       return
     end
     data, count, nextidx, ngarc = d, math.min(g.count, M.MAX_ENTRIES), 1, g.count
@@ -259,6 +279,7 @@ function M.new(fb, env)
     area_list, loc_list = order, all
     for _, a in ipairs(area_list) do a.seen = nil end
     local nzo = #zos
+    diag = { zo_packs = nzo, with_enc = with_enc, table_zones = table_zones, how = how }
     zos, table_data, data = {}, nil, nil
     state = "done"
     log("info", "zones scanned: " .. ngarc .. " zone files, " .. nzo .. " ZO packs, " .. with_enc ..
@@ -272,6 +293,9 @@ function M.new(fb, env)
 
   local function advance()
     if state == "idle" then open()
+    elseif state == "failed" then
+      wait = wait - 1
+      if wait <= 0 then state, open_tries = "idle", M.OPEN_RETRIES - 1 end -- one try per retry
     elseif state == "scan" then
       local last = math.min(nextidx + M.ENTRIES_PER_STEP - 1, count)
       for i = nextidx, last do
@@ -300,14 +324,30 @@ function M.new(fb, env)
     if state == "done" or state == "unsupported" then return end
     local ok, err = pcall(advance)
     if not ok then
-      state = "unsupported"
       log("error", "zone scan failed: " .. tostring(err))
+      fail("scan_error", "zone scan failed")
     end
   end
 
   function self.state() return state end
   function self.found() return state == "done" and #area_list > 0 end
   function self.has_locations() return state == "done" and #loc_list > 0 end
+
+  -- Plain numbers and strings only (no names).
+  function self.diagnostics()
+    return {
+      zones_state = state, zone_files = ngarc, zo_packs = diag.zo_packs, zones_with_encounters = diag.with_enc,
+      areas = #area_list, locations = #loc_list, table_zones = diag.table_zones, zone_id_assignment = diag.how,
+      first_rejection = first_reason or "none", zone_retries = fails,
+    }
+  end
+
+  -- true while the list would be handed out without names that are about to load
+  local function names_pending()
+    if not env.names_state then return false end
+    local s = env.names_state()
+    return s ~= "done" and s ~= "unsupported"
+  end
 
   local function name_of(loc)
     if env.name and loc then
@@ -333,6 +373,7 @@ function M.new(fb, env)
   function self.areas()
     if state == "unsupported" then return nil, "unsupported" end
     if state ~= "done" then self.step(); return nil, "not_ready" end
+    if names_pending() then return nil, "not_ready" end
     local out = {}
     for i, a in ipairs(area_list) do
       out[i] = { id = a.id, name = name_of(a.id), zones = a.zones, encounters = a.encounters }
@@ -344,7 +385,9 @@ function M.new(fb, env)
   -- nil, "not_ready" | "unsupported"
   function self.locations()
     if state == "unsupported" then return nil, "unsupported" end
+    if state == "failed" then return nil, "failed" end -- retrying; the caller may use another source
     if state ~= "done" then self.step(); return nil, "not_ready" end
+    if names_pending() then return nil, "not_ready" end
     local out = {}
     for i, l in ipairs(loc_list) do
       local zs = {}

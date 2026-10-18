@@ -131,6 +131,8 @@ end)
 t.case("no archive: unsupported; no codec: unsupported", function()
   local store = make({}, "de")
   for _ = 1, 40 do store.step() end
+  t.eq(store.state(), "open", "retries slowly instead of giving up at once")
+  for _ = 1, 2000 do store.step() end
   t.eq(store.state(), "unsupported")
   t.eq({ store.name("species", 1) }, { nil, "unsupported" })
   local mock = fb_mock.new({ i18n_dir = "plugin/i18n" })
@@ -186,4 +188,32 @@ t.case("a plausible species file at 98 is kept; integral floats are accepted as 
   t.eq(store.state(), "done")
   t.eq(store.name("species", 700), "N700")
   t.eq(store.name("species", 255.0), "N255")
+end)
+
+t.case("v0.3.2: list() skips empty lines, dedups by name keeping the first id, keeps id order", function()
+  local gt = tb.garc({ [98] = tb.build(lines("Sp", 30)), [14] = tb.build(lines("Mv", 10)),
+    [90] = tb.build({ "", "B", "A", "B", "", "C", "A" }) })
+  local store = make({ ["/a/0/7/6"] = gt }, "de")
+  t.eq({ store.list("location") }, { nil, "not_ready" })
+  t.ok(load(store))
+  local l = store.list("location")
+  t.eq(l, { { id = 1, name = "B" }, { id = 2, name = "A" }, { id = 5, name = "C" } })
+  t.eq(store.count("location"), 7)
+  t.eq({ store.list("nothing") }, { nil, "unknown_kind" })
+  t.eq({ store.list("item") }, { nil, "no_lines" })
+  local d = store.diagnostics()
+  t.eq({ d.text_state, d.lines_species, d.lines_location, d.lines_item, d.species_file_index, d.text_language_index },
+    { "done", 30, 7, 0, 98, 5 })
+end)
+
+t.case("v0.3.2: a text archive that is not mounted yet is retried, not final", function()
+  local gt = tb.garc({ [98] = tb.build(lines("Sp", 30)), [14] = tb.build(lines("Mv", 10)) })
+  local mounted = false
+  local store, mock = make({}, "de")
+  mock.fb.rom.romfs = function() if mounted then return gt end return nil end
+  for _ = 1, 60 do store.step() end
+  t.eq(store.state(), "open")
+  mounted = true
+  t.ok(load(store) or (function() for _ = 1, 100 do store.step() end return store.state() == "done" end)())
+  t.eq(store.name("species", 2), "Sp2")
 end)

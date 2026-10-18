@@ -389,7 +389,8 @@ t.case("location: unsupported/not_ready cases", function()
   t.eq({ b:areas() }, { nil, "not_ready" })
   t.eq({ b:zone_info(1) }, { nil, "not_ready" }, "the archive is retried a few times")
   for _ = 1, 25 do b:zone_info(1) end
-  t.eq({ b:zone_info(1) }, { nil, "unsupported" }, "then no encounter archive is final")
+  t.eq({ b:zone_info(1) }, { nil, "not_ready" }, "then it keeps retrying slowly (state failed), not final")
+  t.eq(b:diagnostics().zones_state, "failed")
 end)
 
 -- personal GARC with types: entry s has types (s % 18, s * 7 % 18), growth s % 6; the last file is the
@@ -449,4 +450,80 @@ t.case("v0.3.1: species names in team and encounter records, locations() through
   t.eq(#locs, 2); t.eq(locs[1].id, 10); t.eq(locs[1].has_encounters, true); t.eq(locs[2].id, 20); t.eq(locs[2].has_encounters, false)
   t.eq(locs[2].name, "Loc20")
   t.eq(a:features().locations, true)
+end)
+
+-- v0.3.2: places never stay empty
+local function loc_text_world(zone_archive)
+  local function lines(prefix, n) local l = {} for i = 0, n - 1 do l[#l + 1] = prefix .. i end return l end
+  local gt = tb.garc({ [98] = tb.build(lines("Sp", 30)), [14] = tb.build(lines("Mv", 10)),
+    [90] = tb.build({ "Loc0", "", "Loc2", "Loc0", "Loc4", "" }) })
+  local w = { ["/a/0/7/6"] = gt }
+  if zone_archive then w["/a/0/1/3"] = zone_archive end
+  return w
+end
+local function text_codec() local c = formats.fake_codec(); c.pk6_decrypt = crypto.decrypt; return c end
+
+t.case("v0.3.2: no zone archive -> locations() from the location text (dedup by name, id order)", function()
+  local a = world_make({ party = { { species = 25 } }, trainer = TRAINER, zone = 0 },
+    { romfs = loc_text_world(nil), codec = text_codec() })
+  t.eq({ a:locations() }, { nil, "not_ready" })
+  ticks(a, 600)
+  local locs = a:locations()
+  t.eq(locs.source, "text")
+  t.eq(#locs, 3)
+  t.eq(locs[1], { id = 0, name = "Loc0", zones = {}, has_encounters = false, source = "text" })
+  t.eq({ locs[2].id, locs[2].name, locs[3].id, locs[3].name }, { 2, "Loc2", 4, "Loc4" })
+  t.eq(a:features().locations, true)
+  t.eq({ a:areas() }, { nil, "not_ready" }, "areas stay as they are")
+  local d = a:diagnostics()
+  t.eq(d.zones_state, "failed"); t.eq(d.first_rejection, "archive_missing"); t.eq(d.locations_source, "text")
+end)
+
+t.case("v0.3.2: zone scan finished with zero locations -> locations() from the text", function()
+  local a = world_make({ party = { { species = 25 } }, trainer = TRAINER, zone = 0 },
+    { romfs = loc_text_world(formats.garc({ "junk junk", "more junk" })), codec = text_codec() })
+  ticks(a, 600)
+  local locs = a:locations()
+  t.eq(locs.source, "text"); t.eq(#locs, 3)
+  t.eq(a:diagnostics().zones_state, "done")
+end)
+
+t.case("v0.3.2: zones with a location use the zone list (source zones)", function()
+  local a = world_make({ party = { { species = 25 } }, trainer = TRAINER, zone = 0 },
+    { romfs = text_world(), codec = text_codec() })
+  ticks(a, 600)
+  local locs = a:locations()
+  t.eq(locs.source, "zones"); t.eq(locs[1].source, "zones"); t.eq(locs[1].name, "Loc10")
+end)
+
+t.case("v0.3.2: diagnostics() holds plain numbers and strings only", function()
+  local a = world_make({ party = { { species = 25 } }, trainer = TRAINER, zone = 0 },
+    { romfs = text_world(), codec = text_codec() })
+  ticks(a, 600)
+  local d = a:diagnostics()
+  for k, v in pairs(d) do t.ok(type(v) == "number" or type(v) == "string", k) end
+  for _, k in ipairs({ "zones_state", "zone_files", "zo_packs", "zones_with_encounters", "areas", "locations",
+    "zone_id_assignment", "first_rejection", "text_state", "lines_location", "lines_species", "species_file_index",
+    "revision", "language", "locations_source" }) do t.ok(d[k] ~= nil, k) end
+  t.eq(d.zones_state, "done"); t.eq(d.zo_packs, 2); t.eq(d.locations, 2); t.eq(d.areas, 1)
+  t.eq(d.text_state, "done"); t.eq(d.lines_location, 40); t.eq(d.species_file_index, 98)
+  t.eq(d.revision, "v1.0"); t.eq(d.language, "de")
+  local text = {}
+  for _, v in pairs(d) do if type(v) == "string" then text[#text + 1] = v end end
+  t.ok(not table.concat(text, " "):find("Loc", 1, true), "no names")
+end)
+
+t.case("v0.3.2 regression: no list without names while the text is still loading", function()
+  local a = world_make({ party = { { species = 25 } }, trainer = TRAINER, zone = 0 },
+    { romfs = text_world(), codec = text_codec() })
+  for _ = 1, 600 do
+    a:tick()
+    local locs, why = a:locations()
+    if locs then
+      for _, l in ipairs(locs) do t.ok(l.name ~= nil, "every handed-out place has its name") end
+    else
+      t.eq(why, "not_ready")
+    end
+  end
+  t.ok(a:locations() ~= nil)
 end)

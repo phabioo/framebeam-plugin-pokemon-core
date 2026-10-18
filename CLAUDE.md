@@ -32,7 +32,7 @@ framebeam-plugin-pokemon-core is the shared Pokémon foundation plugin. It detec
 
 ## Status and commands
 
-- Status: v0.3.1: game detection (Gen 3-7), the `pokemon.core` interface and the Omega Ruby/Alpha Sapphire adapter (team with live stats, boxes, trainer, badges, location with names, encounter areas, battle and wild encounters, game text, icons, region map candidates). Layout: `docs/architecture.md`.
+- Status: v0.3.2: game detection (Gen 3-7), the `pokemon.core` interface and the Omega Ruby/Alpha Sapphire adapter (team with live stats, boxes, trainer, badges, location with names, encounter areas, battle and wild encounters, game text, icons, region map candidates). Layout: `docs/architecture.md`.
 - Sources are modules in `src/`; the sandbox has no `require`, so `lua5.4 tools/bundle.lua` generates the single `plugin/main.lua` (committed; list new modules in `src/modules.txt`). `lua5.4 tools/bundle.lua --check` fails when it is stale.
 - Tests: `lua5.4 tests/run.lua` (fake `fb` in `tests/support/fb_mock.lua`, synthetic PK6 via `tests/support/pk6_*.lua`). CI runs both checks (`.github/workflows/ci.yml`).
 - Packaging: `python3 -I tools/package.py [--out DIR] [--tag vX.Y.Z]` builds the unsigned `<id>-<version>.fbplugin` from `plugin/` (deterministic; `--tag` must equal the manifest version; `--verify FILE` validates structure). Release: `.github/workflows/release.yml` on `v*` tags (README, Releasing); CI also builds the package.

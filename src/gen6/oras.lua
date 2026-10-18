@@ -243,7 +243,10 @@ function M.attach(ctx)
   end
 
   names = text.new(fb, { language_fn = function() return obj:language() end })
-  zone_store = zones.new(fb, { name = function(kind, id) return names.peek(kind, id) end })
+  zone_store = zones.new(fb, {
+    name = function(kind, id) return names.peek(kind, id) end,
+    names_state = function() return names.state() end,
+  })
   map_store = maps.new(fb, ctx.game and ctx.game.id, function() return chosen and chosen.name end)
 
   function obj:revision()
@@ -327,7 +330,8 @@ function M.attach(ctx)
     end
     return {
       icons = icon_store.found(), map = map_store.found(), names = names.ready(), areas = zone_store.found(),
-      locations = zone_store.has_locations(),
+      locations = zone_store.has_locations() or (zone_store.state() ~= "idle" and zone_store.state() ~= "scan" and
+        names.count("location") > 0),
       live_stats = live_seen, location = chosen and A("map_id") ~= nil or (not chosen and any_map),
       battle = chosen and battle_mod.available() or (not chosen and any_battle),
       encounters = chosen and battle_mod.available() or (not chosen and any_battle),
@@ -341,7 +345,37 @@ function M.attach(ctx)
 
   function obj:name(kind, id) return names.name(kind, id) end
   function obj:areas() return zone_store.areas() end
-  function obj:locations() return zone_store.locations() end
+
+  -- Places for a picker. The zone scan is the source; when it is unsupported, failed or found no
+  -- location, every non-empty entry of the game's location text is listed instead (source = "text",
+  -- no zones, no encounter flag). A list is only returned together with its names.
+  function obj:locations()
+    local list, why = zone_store.locations()
+    if list and #list > 0 then
+      for _, l in ipairs(list) do l.source = "zones" end
+      list.source = "zones"
+      return list
+    end
+    if why == "not_ready" then return nil, why end
+    -- the zone scan is over (done empty, unsupported) or failing (retrying): use the text
+    local tl, twhy = names.list("location")
+    if not tl then return nil, twhy == "no_lines" and "unsupported" or twhy end
+    local out = { source = "text" }
+    for i, e in ipairs(tl) do
+      out[i] = { id = e.id, name = e.name, zones = {}, has_encounters = false, source = "text" }
+    end
+    return out
+  end
+
+  function obj:diagnostics()
+    local d = zone_store.diagnostics()
+    for k, v in pairs(names.diagnostics()) do d[k] = v end
+    d.locations_source = d.locations > 0 and "zones" or (names.count("location") > 0 and "text" or "none")
+    d.revision = chosen and chosen.name or "none"
+    local ok, lang = pcall(obj.language, obj)
+    d.language = ok and lang or "unknown"
+    return d
+  end
   function obj:zone_info(zone) return zone_store.zone_info(zone) end
 
   function obj:species_info(species, form)

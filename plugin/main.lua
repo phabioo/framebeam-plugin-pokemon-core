@@ -138,11 +138,11 @@ __mod["core.interface"] = function(...)
 local M = {}
 
 local METHODS = { "team", "box", "box_count", "location", "battle", "encounters", "badges", "trainer", "name",
-  "species_info", "areas", "locations", "zone_info", "icon", "map_candidates", "map_image", "map_selected" }
+  "species_info", "areas", "locations", "zone_info", "icon", "map_candidates", "map_image", "map_selected", "diagnostics" }
 local FEATURE = {
   team = "team", box = "box", location = "location",
   battle = "battle", encounters = "encounters", badges = "badges", trainer = "trainer", name = "names",
-  areas = "areas", locations = "locations", icon = "icons", map_candidates = "map",
+  areas = "areas", locations = "locations", icon = "icons", map_candidates = "map", diagnostics = "diagnostics",
 }
 
 local function has(adapter, name)
@@ -1096,7 +1096,10 @@ function M.attach(ctx)
   end
 
   names = text.new(fb, { language_fn = function() return obj:language() end })
-  zone_store = zones.new(fb, { name = function(kind, id) return names.peek(kind, id) end })
+  zone_store = zones.new(fb, {
+    name = function(kind, id) return names.peek(kind, id) end,
+    names_state = function() return names.state() end,
+  })
   map_store = maps.new(fb, ctx.game and ctx.game.id, function() return chosen and chosen.name end)
 
   function obj:revision()
@@ -1180,7 +1183,8 @@ function M.attach(ctx)
     end
     return {
       icons = icon_store.found(), map = map_store.found(), names = names.ready(), areas = zone_store.found(),
-      locations = zone_store.has_locations(),
+      locations = zone_store.has_locations() or (zone_store.state() ~= "idle" and zone_store.state() ~= "scan" and
+        names.count("location") > 0),
       live_stats = live_seen, location = chosen and A("map_id") ~= nil or (not chosen and any_map),
       battle = chosen and battle_mod.available() or (not chosen and any_battle),
       encounters = chosen and battle_mod.available() or (not chosen and any_battle),
@@ -1194,7 +1198,37 @@ function M.attach(ctx)
 
   function obj:name(kind, id) return names.name(kind, id) end
   function obj:areas() return zone_store.areas() end
-  function obj:locations() return zone_store.locations() end
+
+  -- Places for a picker. The zone scan is the source; when it is unsupported, failed or found no
+  -- location, every non-empty entry of the game's location text is listed instead (source = "text",
+  -- no zones, no encounter flag). A list is only returned together with its names.
+  function obj:locations()
+    local list, why = zone_store.locations()
+    if list and #list > 0 then
+      for _, l in ipairs(list) do l.source = "zones" end
+      list.source = "zones"
+      return list
+    end
+    if why == "not_ready" then return nil, why end
+    -- the zone scan is over (done empty, unsupported) or failing (retrying): use the text
+    local tl, twhy = names.list("location")
+    if not tl then return nil, twhy == "no_lines" and "unsupported" or twhy end
+    local out = { source = "text" }
+    for i, e in ipairs(tl) do
+      out[i] = { id = e.id, name = e.name, zones = {}, has_encounters = false, source = "text" }
+    end
+    return out
+  end
+
+  function obj:diagnostics()
+    local d = zone_store.diagnostics()
+    for k, v in pairs(names.diagnostics()) do d[k] = v end
+    d.locations_source = d.locations > 0 and "zones" or (names.count("location") > 0 and "text" or "none")
+    d.revision = chosen and chosen.name or "none"
+    local ok, lang = pcall(obj.language, obj)
+    d.language = ok and lang or "unknown"
+    return d
+  end
   function obj:zone_info(zone) return zone_store.zone_info(zone) end
 
   function obj:species_info(species, form)
@@ -2013,6 +2047,8 @@ M.LANG_INDEX = { ja = { 1, 0 }, en = { 2 }, fr = { 3 }, it = { 4 }, de = { 5 }, 
 M.SEARCH_PER_STEP = 8 -- files examined per step while looking for the species list
 M.SPECIES_PROBES = { 1, 25, 150, 300, 500, 721 }
 M.FALLBACK_STEPS = 300 -- steps to wait for the game language before falling back to EN
+M.RETRY_EVERY = 25     -- steps to wait before going through the archive candidates again
+M.MAX_RETRIES = 40     -- rounds through the candidates before the state becomes "unsupported" for good
 
 local SPECIAL = { [0xE07F] = 0x202F, [0xE08D] = 0x2026, [0xE08E] = 0x2642, [0xE08F] = 0x2640 }
 
@@ -2115,8 +2151,9 @@ function M.new(fb, opts)
   local state = can and "idle" or "unsupported" -- idle | open | fetch | search | done | unsupported
   local files, lines = {}, {}
   local cands, cand, data, kinds_left, garc_count, search_list, search_pos
-local found_species_file = nil
+  local found_species_file = nil
   local waited, fallback_used = 0, false
+  local rounds, pause = 0, 0
 
   local function candidates(lang)
     local out, seen = {}, {}
@@ -2134,10 +2171,18 @@ local found_species_file = nil
   end
 
   local function open_next()
+    if pause > 0 then pause = pause - 1; return end
     cand = cand + 1
     if cand > #cands then
-      state = "unsupported"
-      if fb.log and fb.log.warn then fb.log.warn("no readable game text archive found") end
+      -- the ROM may only be mounted later: go through the candidates again, slowly, before giving up
+      rounds = rounds + 1
+      if rounds > M.MAX_RETRIES then
+        state = "unsupported"
+        if fb.log and fb.log.warn then fb.log.warn("no readable game text archive found; giving up") end
+      else
+        cand, pause = 0, M.RETRY_EVERY
+        if rounds == 1 and fb.log and fb.log.warn then fb.log.warn("no readable game text archive found; retrying") end
+      end
       return
     end
     local idx = cands[cand]
@@ -2249,6 +2294,33 @@ local found_species_file = nil
   function self.ready() return state == "done" end
   function self.language_index() return cands and cands.current end
 
+  -- Plain numbers and strings only: state, language index, lines per kind, species file index.
+  function self.diagnostics()
+    local d = { text_state = state, text_language_index = cands and cands.current or -1, text_retries = rounds }
+    for _, k in ipairs(M.KIND_ORDER) do d["lines_" .. k] = files[k] and files[k].count or 0 end
+    d.species_file_index = files.species and (found_species_file or M.FILES.species) or -1
+    return d
+  end
+
+  function self.count(kind) return state == "done" and files[kind] and files[kind].count or 0 end
+
+  -- Every id of `kind` with a non-empty name, deduplicated by name (first id kept), in id order:
+  -- { { id, name }, ... }; nil, "not_ready" | "unsupported" | "unknown_kind" | "no_lines".
+  function self.list(kind)
+    if not M.FILES[kind] then return nil, "unknown_kind" end
+    if state == "unsupported" then return nil, "unsupported" end
+    if state ~= "done" then self.step(); return nil, "not_ready" end
+    local f = files[kind]
+    if not f or f.count < 1 then return nil, "no_lines" end
+    local out, seen = {}, {}
+    for id = 0, f.count - 1 do
+      local n = self.name(kind, id)
+      if n and not seen[n] then seen[n] = true; out[#out + 1] = { id = id, name = n } end
+    end
+    if #out == 0 then return nil, "no_lines" end
+    return out
+  end
+
   -- Like name() but never advances the loading: the string, or nil when not loaded / unknown.
   function self.peek(kind, id)
     if state ~= "done" then return nil end
@@ -2306,6 +2378,8 @@ M.MAX_SPECIES = 721
 M.ENTRIES_PER_STEP = 8
 M.MAX_ENTRIES = 2000
 M.MAX_LZ_OUTPUT = 4 * 1024 * 1024
+M.RETRY_EVERY = 25         -- steps between retries after a failure (state "failed")
+M.MAX_RETRIES = 40         -- retries before the state becomes "unsupported" for good
 
 -- slot groups in file order; horde A/B/C are merged into "horde"
 M.GROUPS = {
@@ -2400,17 +2474,22 @@ local function location_of(rec)
 end
 
 -- env.name(kind, id) -> string or nil (optional, for names).
+-- env.names_state() -> state of the game text store (optional): while it is neither "done" nor
+-- "unsupported", areas() and locations() answer "not_ready", so a list is never handed out (and cached
+-- by a consumer) without names that are only a few steps away.
 function M.new(fb, env)
   env = env or {}
   local self = {}
   local codec = fb.codec
   local can = fb.rom and fb.rom.romfs and codec and codec.garc and codec.garc_file and true or false
-  local state = can and "idle" or "unsupported" -- idle | scan | done | unsupported
+  local state = can and "idle" or "unsupported" -- idle | scan | done | failed (retrying) | unsupported
   local data, count, nextidx = nil, 0, 1
   local zos, table_data = {}, nil
   local zones, area_list, loc_list, last_zone = {}, {}, {}, -1
   local open_tries = 0
   local first_reason, ngarc = nil, 0
+  local fails, wait = 0, 0
+  local diag = { zo_packs = 0, with_enc = 0, table_zones = 0, how = "none" }
 
   local function log(level, msg)
     if fb.log and fb.log[level] then fb.log[level](msg) end
@@ -2420,20 +2499,33 @@ function M.new(fb, env)
     if r and not first_reason then first_reason = r end
   end
 
+  -- A failure is not final: the archive may only become readable later (the ROM is mounted late)
+  -- and a consumer treats "unsupported" as permanent. Retry slowly, give up after MAX_RETRIES.
+  local function fail(reason, msg)
+    note_reason(reason)
+    fails = fails + 1
+    data, zos, table_data = nil, {}, nil
+    if fails > M.MAX_RETRIES then
+      state = "unsupported"
+      log("warn", msg .. "; giving up")
+    else
+      state, wait = "failed", M.RETRY_EVERY
+      if fails == 1 then log("warn", msg .. "; retrying") end
+    end
+  end
+
   local function open()
     open_tries = open_tries + 1
     local d = fb.rom.romfs(M.GARC_PATH)
     if type(d) ~= "string" then
       if open_tries >= M.OPEN_RETRIES then
-        state = "unsupported"
-        log("warn", "encounter data not found at " .. M.GARC_PATH)
+        fail("archive_missing", "encounter data not found at " .. M.GARC_PATH)
       end
       return
     end
     local ok, g = pcall(codec.garc, d)
     if not ok or type(g) ~= "table" or type(g.count) ~= "number" or g.count < 1 then
-      state = "unsupported"
-      log("warn", "encounter data at " .. M.GARC_PATH .. " is not a readable GARC")
+      fail("archive_unreadable", "encounter data at " .. M.GARC_PATH .. " is not a readable GARC")
       return
     end
     data, count, nextidx, ngarc = d, math.min(g.count, M.MAX_ENTRIES), 1, g.count
@@ -2543,6 +2635,7 @@ function M.new(fb, env)
     area_list, loc_list = order, all
     for _, a in ipairs(area_list) do a.seen = nil end
     local nzo = #zos
+    diag = { zo_packs = nzo, with_enc = with_enc, table_zones = table_zones, how = how }
     zos, table_data, data = {}, nil, nil
     state = "done"
     log("info", "zones scanned: " .. ngarc .. " zone files, " .. nzo .. " ZO packs, " .. with_enc ..
@@ -2556,6 +2649,9 @@ function M.new(fb, env)
 
   local function advance()
     if state == "idle" then open()
+    elseif state == "failed" then
+      wait = wait - 1
+      if wait <= 0 then state, open_tries = "idle", M.OPEN_RETRIES - 1 end -- one try per retry
     elseif state == "scan" then
       local last = math.min(nextidx + M.ENTRIES_PER_STEP - 1, count)
       for i = nextidx, last do
@@ -2584,14 +2680,30 @@ function M.new(fb, env)
     if state == "done" or state == "unsupported" then return end
     local ok, err = pcall(advance)
     if not ok then
-      state = "unsupported"
       log("error", "zone scan failed: " .. tostring(err))
+      fail("scan_error", "zone scan failed")
     end
   end
 
   function self.state() return state end
   function self.found() return state == "done" and #area_list > 0 end
   function self.has_locations() return state == "done" and #loc_list > 0 end
+
+  -- Plain numbers and strings only (no names).
+  function self.diagnostics()
+    return {
+      zones_state = state, zone_files = ngarc, zo_packs = diag.zo_packs, zones_with_encounters = diag.with_enc,
+      areas = #area_list, locations = #loc_list, table_zones = diag.table_zones, zone_id_assignment = diag.how,
+      first_rejection = first_reason or "none", zone_retries = fails,
+    }
+  end
+
+  -- true while the list would be handed out without names that are about to load
+  local function names_pending()
+    if not env.names_state then return false end
+    local s = env.names_state()
+    return s ~= "done" and s ~= "unsupported"
+  end
 
   local function name_of(loc)
     if env.name and loc then
@@ -2617,6 +2729,7 @@ function M.new(fb, env)
   function self.areas()
     if state == "unsupported" then return nil, "unsupported" end
     if state ~= "done" then self.step(); return nil, "not_ready" end
+    if names_pending() then return nil, "not_ready" end
     local out = {}
     for i, a in ipairs(area_list) do
       out[i] = { id = a.id, name = name_of(a.id), zones = a.zones, encounters = a.encounters }
@@ -2628,7 +2741,9 @@ function M.new(fb, env)
   -- nil, "not_ready" | "unsupported"
   function self.locations()
     if state == "unsupported" then return nil, "unsupported" end
+    if state == "failed" then return nil, "failed" end -- retrying; the caller may use another source
     if state ~= "done" then self.step(); return nil, "not_ready" end
+    if names_pending() then return nil, "not_ready" end
     local out = {}
     for i, l in ipairs(loc_list) do
       local zs = {}
