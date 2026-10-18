@@ -24,6 +24,8 @@ M.LANG_INDEX = { ja = { 1, 0 }, en = { 2 }, fr = { 3 }, it = { 4 }, de = { 5 }, 
 M.SEARCH_PER_STEP = 8 -- files examined per step while looking for the species list
 M.SPECIES_PROBES = { 1, 25, 150, 300, 500, 721 }
 M.FALLBACK_STEPS = 300 -- steps to wait for the game language before falling back to EN
+M.RETRY_EVERY = 25     -- steps to wait before going through the archive candidates again
+M.MAX_RETRIES = 40     -- rounds through the candidates before the state becomes "unsupported" for good
 
 local SPECIAL = { [0xE07F] = 0x202F, [0xE08D] = 0x2026, [0xE08E] = 0x2642, [0xE08F] = 0x2640 }
 
@@ -126,8 +128,9 @@ function M.new(fb, opts)
   local state = can and "idle" or "unsupported" -- idle | open | fetch | search | done | unsupported
   local files, lines = {}, {}
   local cands, cand, data, kinds_left, garc_count, search_list, search_pos
-local found_species_file = nil
+  local found_species_file = nil
   local waited, fallback_used = 0, false
+  local rounds, pause = 0, 0
 
   local function candidates(lang)
     local out, seen = {}, {}
@@ -145,10 +148,18 @@ local found_species_file = nil
   end
 
   local function open_next()
+    if pause > 0 then pause = pause - 1; return end
     cand = cand + 1
     if cand > #cands then
-      state = "unsupported"
-      if fb.log and fb.log.warn then fb.log.warn("no readable game text archive found") end
+      -- the ROM may only be mounted later: go through the candidates again, slowly, before giving up
+      rounds = rounds + 1
+      if rounds > M.MAX_RETRIES then
+        state = "unsupported"
+        if fb.log and fb.log.warn then fb.log.warn("no readable game text archive found; giving up") end
+      else
+        cand, pause = 0, M.RETRY_EVERY
+        if rounds == 1 and fb.log and fb.log.warn then fb.log.warn("no readable game text archive found; retrying") end
+      end
       return
     end
     local idx = cands[cand]
@@ -259,6 +270,33 @@ local found_species_file = nil
   function self.state() return state end
   function self.ready() return state == "done" end
   function self.language_index() return cands and cands.current end
+
+  -- Plain numbers and strings only: state, language index, lines per kind, species file index.
+  function self.diagnostics()
+    local d = { text_state = state, text_language_index = cands and cands.current or -1, text_retries = rounds }
+    for _, k in ipairs(M.KIND_ORDER) do d["lines_" .. k] = files[k] and files[k].count or 0 end
+    d.species_file_index = files.species and (found_species_file or M.FILES.species) or -1
+    return d
+  end
+
+  function self.count(kind) return state == "done" and files[kind] and files[kind].count or 0 end
+
+  -- Every id of `kind` with a non-empty name, deduplicated by name (first id kept), in id order:
+  -- { { id, name }, ... }; nil, "not_ready" | "unsupported" | "unknown_kind" | "no_lines".
+  function self.list(kind)
+    if not M.FILES[kind] then return nil, "unknown_kind" end
+    if state == "unsupported" then return nil, "unsupported" end
+    if state ~= "done" then self.step(); return nil, "not_ready" end
+    local f = files[kind]
+    if not f or f.count < 1 then return nil, "no_lines" end
+    local out, seen = {}, {}
+    for id = 0, f.count - 1 do
+      local n = self.name(kind, id)
+      if n and not seen[n] then seen[n] = true; out[#out + 1] = { id = id, name = n } end
+    end
+    if #out == 0 then return nil, "no_lines" end
+    return out
+  end
 
   -- Like name() but never advances the loading: the string, or nil when not loaded / unknown.
   function self.peek(kind, id)

@@ -1,6 +1,6 @@
 # Roadmap
 
-Status: in progress: skeleton and ORAS adapter; v0.3.1 (v0.3.0 plus fixes for zones and species names, and `locations()`) delivers live team stats, trainer/badges/money, location with names, encounter areas, battle state, wild encounters and names from the game text for Omega Ruby / Alpha Sapphire (v1.0 and v1.4); real-game verification of the derived and battle addresses is open (`docs/games/omega-ruby-alpha-sapphire.md`). Depends on FrameBeam plugin API v1 (0.11, planned); see https://github.com/phabioo/framebeam `docs/roadmap.md`.
+Status: in progress: skeleton and ORAS adapter; v0.3.2 (v0.3.1 plus places that never stay empty: text fallback for `locations()`, names before lists, retried scans, `diagnostics()`; v0.3.1: fixes for zones and species names, and `locations()`) delivers live team stats, trainer/badges/money, location with names, encounter areas, battle state, wild encounters and names from the game text for Omega Ruby / Alpha Sapphire (v1.0 and v1.4); real-game verification of the derived and battle addresses is open (`docs/games/omega-ruby-alpha-sapphire.md`). Depends on FrameBeam plugin API v1 (0.11, planned); see https://github.com/phabioo/framebeam `docs/roadmap.md`.
 
 ## v0.1 Omega Ruby / Alpha Sapphire (3DS, Gen 6)
 
@@ -10,7 +10,9 @@ Status: in progress: skeleton and ORAS adapter; v0.3.1 (v0.3.0 plus fixes for zo
 - Location/route table keyed by internal IDs, with self-recorded map coordinates; `provides` interface for other plugins.
 - Offsets documented per game in `docs/games/<game>.md`; verified locally by the maintainer with the FrameBeam developer mode.
 
-### Status v0.3.1 (ORAS)
+### Status v0.3.2 (ORAS)
+
+- v0.3.2: `locations()` no longer stays empty (zone scan failed, unsupported or empty: every named line of the location text, `source = "text"`); lists are handed out only with names (a consumer caches the first list); failed archive opens and scans are retried slowly instead of ending in a final `unsupported` (zones and game text); new `diagnostics()` (counts, states, first rejection reason, no names). Real-game confirmation is open.
 
 - v0.3.1: lenient ZO pack parsing (a bad offset no longer drops the pack), table-only zones, `locations()` (all places, towns included), the archive open is retried, species list found by content when file 98 is implausible, `species_name` on encounter records/events, diagnostics log lines (counts only). Real-game confirmation of the two fixed bugs is open.
 

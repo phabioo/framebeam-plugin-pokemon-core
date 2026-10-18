@@ -153,6 +153,9 @@ end)
 t.case("missing or broken archives never raise", function()
   local store, _, run = make({})
   run()
+  t.eq(store.state(), "failed", "a missing archive is retried, not final")
+  t.eq({ store.areas() }, { nil, "not_ready" })
+  for _ = 1, (zones.MAX_RETRIES + 2) * (zones.RETRY_EVERY + 2) do store.step() end
   t.eq(store.state(), "unsupported")
   t.eq({ store.areas() }, { nil, "unsupported" })
   local junk, _, run2 = make({ ["/a/0/1/3"] = formats.garc({ "junk", "more junk" }) })
@@ -265,5 +268,56 @@ t.case("the archive is retried when it is not readable yet; a failing entry does
   local mock2 = fb_mock.new({ game = { system = "3ds" }, codec = formats.fake_codec(), i18n_dir = "plugin/i18n", romfs = {} })
   local s2 = zones.new(mock2.fb, {})
   for _ = 1, zones.OPEN_RETRIES + 1 do s2.step() end
-  t.eq(s2.state(), "unsupported")
+  t.eq(s2.state(), "failed")
+end)
+
+-- v0.3.2
+t.case("v0.3.2: no list is handed out while the game text is still loading", function()
+  local text_state = "open"
+  local mock = fb_mock.new({ game = { system = "3ds" }, codec = formats.fake_codec(), i18n_dir = "plugin/i18n", romfs = world2() })
+  local store = zones.new(mock.fb, { name = function(_, id) return "N" .. id end, names_state = function() return text_state end })
+  for _ = 1, 100 do store.step() end
+  t.eq(store.state(), "done")
+  t.eq({ store.locations() }, { nil, "not_ready" })
+  t.eq({ store.areas() }, { nil, "not_ready" })
+  text_state = "done"
+  t.eq(store.locations()[1].name, "N10"); t.eq(store.areas()[1].name, "N10")
+  text_state = "unsupported"
+  t.ok(store.locations() ~= nil, "without any text the zone list is still returned")
+end)
+
+t.case("v0.3.2: an archive that becomes readable late is still scanned (no final unsupported)", function()
+  local good = world2()["/a/0/1/3"]
+  local steps = 0
+  local mock = fb_mock.new({ game = { system = "3ds" }, codec = formats.fake_codec(), i18n_dir = "plugin/i18n", romfs = {} })
+  mock.fb.rom.romfs = function() if steps < 60 then return nil end return good end
+  local store = zones.new(mock.fb, {})
+  while steps < 400 and store.state() ~= "done" do steps = steps + 1; store.step() end
+  t.eq(store.state(), "done"); t.eq(#store.locations(), 5)
+  t.ok(store.diagnostics().zone_retries >= 1)
+end)
+
+t.case("v0.3.2: an unreadable GARC and a failing scan are retried, not final", function()
+  local good = world2()["/a/0/1/3"]
+  local mock = fb_mock.new({ game = { system = "3ds" }, codec = formats.fake_codec(), i18n_dir = "plugin/i18n", romfs = { ["/a/0/1/3"] = good } })
+  local garc, broken = mock.fb.codec.garc, true
+  mock.fb.codec.garc = function(d) if broken then error("not yet") end return garc(d) end
+  local store = zones.new(mock.fb, {})
+  store.step()
+  t.eq(store.state(), "failed"); t.eq(store.diagnostics().first_rejection, "archive_unreadable")
+  t.eq({ store.locations() }, { nil, "failed" })
+  broken = false
+  for _ = 1, 100 do store.step() end
+  t.eq(store.state(), "done"); t.eq(#store.locations(), 5)
+end)
+
+t.case("v0.3.2: diagnostics() counts and the first rejection reason", function()
+  local store, _, run = make(world2())
+  t.eq(store.diagnostics().zones_state, "idle")
+  run()
+  local d = store.diagnostics()
+  t.eq({ d.zones_state, d.zone_files, d.zo_packs, d.zones_with_encounters, d.areas, d.locations },
+    { "done", 6, 4, 3, 2, 5 })
+  t.eq(d.zone_id_assignment, "garc index"); t.eq(d.table_zones, 2); t.ok(type(d.first_rejection) == "string")
+  for k, v in pairs(d) do t.ok(type(v) == "number" or type(v) == "string", k) end
 end)
