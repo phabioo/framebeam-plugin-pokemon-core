@@ -527,3 +527,24 @@ t.case("v0.3.2 regression: no list without names while the text is still loading
   end
   t.ok(a:locations() ~= nil)
 end)
+
+t.case("v0.3.3: personal table in an LZ11-compressed GARC entry is read", function()
+  local personal = require("gen6.personal")
+  local whole = {}
+  for s = 0, 721 do
+    local e = {}
+    for i = 1, 0x50 do e[i] = "\0" end
+    e[0x15 + 1] = string.char(s % 6)
+    whole[#whole + 1] = table.concat(e)
+  end
+  local garc = formats.garc({ formats.lz11_literal(table.concat(whole)) })
+  local mock = fb_mock.new({ game = { system = "3ds" }, codec = formats.fake_codec(), i18n_dir = "plugin/i18n",
+    romfs = { ["/a/1/9/5"] = garc } })
+  local p = personal.new(mock.fb, { paths = { "/a/1/9/5" } })
+  t.eq(p.growth_rate(25), 25 % 6)
+  t.eq(p.diagnostics().personal_ok, 1)
+  local q = personal.new(fb_mock.new({ game = { system = "3ds" }, codec = formats.fake_codec(), i18n_dir = "plugin/i18n",
+    romfs = { ["/a/1/9/5"] = "GARC" .. string.rep("\0", 40) } }).fb, { paths = { "/a/1/9/5" } })
+  t.eq(q.growth_rate(25), nil)
+  t.ok(q.diagnostics().personal_first_rejection:find("garc_rejected", 1, true))
+end)

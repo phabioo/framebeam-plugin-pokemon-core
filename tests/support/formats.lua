@@ -36,7 +36,7 @@ function M.garc(files)
   local head_len = 0x1C
   local data_offset = head_len + #fato_s + #fatb_s + 12
   local total = data_offset + #body
-  local head = "GARC" .. pack("<I4I2I2I4I4I4I4", head_len, 0xFEFF, 0x0400, 4, data_offset, total, pos)
+  local head = "CRAG" .. pack("<I4I2I2I4I4I4I4", head_len, 0xFEFF, 0x0400, 4, data_offset, total, pos)
   return head .. fato_s .. fatb_s .. fimb .. body
 end
 
@@ -112,7 +112,7 @@ end
 function M.fake_codec(extra)
   local c = {}
   local function parse(d)
-    if type(d) ~= "string" or d:sub(1, 4) ~= "GARC" then return nil end
+    if type(d) ~= "string" or d:sub(1, 4) ~= "CRAG" then return nil end
     local data_offset = unpack("<I4", d, 0x11)
     local n = unpack("<I2", d, 0x1C + 8 + 1)
     local files = {}

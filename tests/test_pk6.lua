@@ -82,3 +82,10 @@ t.case("bad input", function()
   t.eq(select(2, pk6.parse(string.rep("\0", 100))), "bad_length")
   t.eq(select(2, pk6.parse(nil)), "bad_type")
 end)
+
+t.case("language byte: 7 is Spanish, 6 is unused (PKHeX LanguageID)", function()
+  local function lang(id) return pk6.parse(build.build({ language_id = id })).language end
+  t.eq(lang(7), "es")
+  t.eq(lang(6), nil)
+  t.eq({ lang(1), lang(2), lang(3), lang(4), lang(5), lang(8) }, { "ja", "en", "fr", "it", "de", "ko" })
+end)

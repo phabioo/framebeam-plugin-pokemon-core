@@ -286,6 +286,40 @@ end
 return M
 
 end
+__mod["gen6.garc_entry"] = function(...)
+-- Shared GARC entry reading. pk3DS reads every GARC entry through GARCEntry, which LZ11-decompresses
+-- any entry whose first byte is 0x11 and keeps the raw bytes when that fails (pk3DS.Core/CTR/GARC.cs).
+-- Plain readers (text, personal, icons) use `entry`; zones and maps use `decompress` directly.
+local M = {}
+
+M.MAX_LZ_OUTPUT = 4 * 1024 * 1024 -- output size limit of a decompressed entry
+
+-- Decompresses `e` when its first byte is 0x11 (also 0x10 with allow_lz10) via codec.lz_decompress.
+-- Returns data, status: "lz" (decompressed), "raw" (not compressed or no codec) or
+-- "lz_failed" (data = the raw entry; decompression raised, returned a non-string or exceeded the limit).
+function M.decompress(codec, e, allow_lz10)
+  if type(e) ~= "string" then return e, "raw" end
+  local b = e:byte(1)
+  if (b == 0x11 or (allow_lz10 and b == 0x10)) and codec and codec.lz_decompress then
+    local ok, out = pcall(codec.lz_decompress, e)
+    if ok and type(out) == "string" and #out <= M.MAX_LZ_OUTPUT then return out, "lz" end
+    return e, "lz_failed"
+  end
+  return e, "raw"
+end
+
+-- GARC file `index` (1-based, first sub-file), decompressed if needed. Returns data, status
+-- (see decompress); nil, "garc_error" | "no_entry" when the entry cannot be read.
+function M.entry(codec, d, index)
+  local ok, e = pcall(codec.garc_file, d, index, 1)
+  if not ok then return nil, "garc_error" end
+  if type(e) ~= "string" or #e == 0 then return nil, "no_entry" end
+  return M.decompress(codec, e)
+end
+
+return M
+
+end
 __mod["gen6.growth"] = function(...)
 -- EXP <-> level for the six standard growth curves (formulas only, no tables).
 -- Rate IDs follow the games' personal data (PKHeX: Experience.GetEXPTable /
@@ -347,6 +381,7 @@ __mod["gen6.icons"] = function(...)
 -- validated by content (see docs/games/omega-ruby-alpha-sapphire.md, "Icons").
 -- Discovery runs one small step per call (one directory listing or one
 -- candidate validation) so no entry call comes near the 500 ms / 20M budget.
+local garc_entry = require("gen6.garc_entry")
 local M = {}
 
 M.CANDIDATE_PATHS = {}      -- known paths are not sourced; discovery finds the file
@@ -360,6 +395,8 @@ M.MAX_STEPS = 4000
 M.INDEX_FILE = "icons/index.txt"      -- first line: RomFS path of the icon GARC
 M.OVERRIDE_FILE = "config/icon_garc.txt" -- optional: RomFS path to try first
 M.MAX_SPECIES = 721
+M.PROBE_PATH = "/a/0/9/1"   -- Project Pokemon ORAS file system: "971 box sprites" (diagnostics probe only)
+M.PROBE_ENTRIES = { 1, 25, 700 } -- 0-based GARC entries inspected by diagnostics()
 
 local function first_line(s)
   if type(s) ~= "string" then return nil end
@@ -385,17 +422,23 @@ function M.new(fb, personal)
   end
 
   -- Accepts the GARC when sampled entries decode to BCLIM images of an accepted size.
+  local first_reject = nil
+  local function reject(why) if not first_reject then first_reject = why end; return false end
+  local function short(v) return (tostring(v):gsub("[^%w _%.:%-]", "?"):sub(1, 40)) end
+
   local function validate(d)
-    local g = codec.garc(d)
-    if type(g) ~= "table" or type(g.count) ~= "number" then return false end
-    if g.count < M.MIN_ENTRIES or g.count > M.MAX_ENTRIES then return false end
+    local ok, g, gerr = pcall(codec.garc, d)
+    if not ok or type(g) ~= "table" or type(g.count) ~= "number" then
+      return reject("garc_rejected: " .. short(ok and gerr or g))
+    end
+    if g.count < M.MIN_ENTRIES or g.count > M.MAX_ENTRIES then return reject("garc_entries_" .. g.count) end
     for _, s in ipairs(M.SAMPLES) do
-      local e = codec.garc_file(d, s + 1, 1)
-      if type(e) ~= "string" then return false end
+      local e = garc_entry.entry(codec, d, s + 1)
+      if type(e) ~= "string" then return reject("entry_unreadable_" .. s) end
       local img = codec.bclim(e)
-      if type(img) ~= "table" or not M.SIZES[tostring(img.width) .. "x" .. tostring(img.height)] then
-        return false
-      end
+      if type(img) ~= "table" then return reject("bclim_failed_" .. s) end
+      local size = tostring(img.width) .. "x" .. tostring(img.height)
+      if not M.SIZES[size] then return reject("size_" .. size) end
     end
     return true
   end
@@ -460,6 +503,60 @@ function M.new(fb, personal)
     end
   end
 
+  -- Probe of the icon archive for diagnostics(): numbers and short strings only, no pixels, no names.
+  -- Read once and cached; the archive is the accepted one or, if none was accepted, M.PROBE_PATH.
+  local probe, probe_key
+  local function hex(b) return b and string.format("0x%02X", b) or "none" end
+  local function probe_entry(out, tag, d, n)
+    local ok, raw = pcall(codec.garc_file, d, n + 1, 1)
+    if not ok or type(raw) ~= "string" or #raw == 0 then out[tag .. "_first"] = "unreadable"; return end
+    out[tag .. "_first"] = hex(raw:byte(1))
+    local e, status = garc_entry.decompress(codec, raw)
+    out[tag .. "_lz11"] = status == "lz" and 1 or 0
+    if status == "lz_failed" then out[tag .. "_lz_failed"] = 1 end
+    out[tag .. "_size"] = #e
+    local fmt, w, h = -1, -1, -1
+    if #e >= 0x28 and e:sub(#e - 0x27, #e - 0x24) == "CLIM" then
+      w, h = string.unpack("<I2I2", e, #e - 0x28 + 0x1C + 1)
+      fmt = e:byte(#e - 0x28 + 0x20 + 1)
+    end
+    out[tag .. "_fmt"], out[tag .. "_w"], out[tag .. "_h"] = fmt, w, h
+    out[tag .. "_px0"] = #e >= 2 and string.format("0x%04X", string.unpack("<I2", e, 1)) or "none"
+  end
+
+  local function run_probe()
+    local out = { icons_state = state, icons_path = path or "none", icons_count = -1, icons_garc_ok = 0 }
+    if not can then return out end
+    local d = data
+    if not d then
+      local okr, r = pcall(fb.rom.romfs, M.PROBE_PATH)
+      d = okr and type(r) == "string" and r or nil
+      out.icons_path = M.PROBE_PATH .. (d and "" or " (unreadable)")
+    end
+    if d then
+      local ok, g, gerr = pcall(codec.garc, d)
+      if ok and type(g) == "table" and type(g.count) == "number" then
+        out.icons_garc_ok, out.icons_count = 1, g.count
+        for _, n in ipairs(M.PROBE_ENTRIES) do probe_entry(out, "icon_e" .. n, d, n) end
+      else
+        out.icons_garc_error = short(ok and gerr or g)
+      end
+    end
+    return out
+  end
+
+  function self.diagnostics()
+    if not can then return { icons_state = state } end
+    -- one probe per archive: the fixed probe path until discovery accepts another archive
+    local key = path or M.PROBE_PATH
+    if not probe or probe_key ~= key then probe, probe_key = run_probe(), key end
+    local out = {}
+    for k, v in pairs(probe) do out[k] = v end
+    out.icons_state = state
+    out.icons_first_rejection = first_reject or "none"
+    return out
+  end
+
   function self.found() return state == "done" end
   function self.state() return state end
   function self.path() return path end
@@ -468,6 +565,7 @@ function M.new(fb, personal)
   function self.reset()
     if can then state = "idle" end
     data, path, forced, dirs, cands, steps = nil, nil, {}, {}, {}, 0
+    probe, probe_key, first_reject = nil, nil, nil
   end
 
   local function entry_for(species, form)
@@ -494,7 +592,7 @@ function M.new(fb, personal)
       if state ~= "done" then return nil, "not_ready" end
     end
     local idx, exact = entry_for(species, form)
-    local blob = codec.garc_file(data, idx + 1, 1)
+    local blob = garc_entry.entry(codec, data, idx + 1)
     if type(blob) ~= "string" then return nil, "unknown_species" end
     local img = codec.bclim(blob)
     if type(img) ~= "table" then return nil, "unknown_species" end
@@ -518,6 +616,7 @@ __mod["gen6.maps"] = function(...)
 -- machine: one step = one directory listing, one file read, or a bounded batch
 -- of entries, so no entry call nears the 500 ms / 20M instruction budget.
 local darc = require("gen6.darc")
+local garc_entry = require("gen6.garc_entry")
 
 local M = {}
 
@@ -675,8 +774,8 @@ function M.new(fb, game_id, revision_fn)
   local function examine(e, id)
     local b = e:byte(1)
     if (b == 0x10 or b == 0x11) and #e <= M.MAX_LZ_INPUT and codec.lz_decompress and #e > 4 then
-      local ok, out = pcall(codec.lz_decompress, e)
-      if ok and type(out) == "string" and #out <= M.MAX_LZ_OUTPUT then examine_plain(out, id) end
+      local out, status = garc_entry.decompress(codec, e, true)
+      if status == "lz" then examine_plain(out, id) end
       return
     end
     examine_plain(e, id)
@@ -816,10 +915,10 @@ function M.new(fb, game_id, revision_fn)
       e = codec.garc_file(d, entry, 1)
     end
     if type(e) ~= "string" then return nil, "unknown_map" end
-    local b = e:byte(1)
-    if (b == 0x10 or b == 0x11) and codec.lz_decompress and not M.bclim_size(e) then
-      e = codec.lz_decompress(e)
-      if type(e) ~= "string" then return nil, "unknown_map" end
+    if not M.bclim_size(e) then
+      local out, status = garc_entry.decompress(codec, e, true)
+      if status == "lz_failed" then return nil, "unknown_map" end
+      e = out
     end
     if sub then
       local list = darc.parse(e)
@@ -1223,6 +1322,8 @@ function M.attach(ctx)
   function obj:diagnostics()
     local d = zone_store.diagnostics()
     for k, v in pairs(names.diagnostics()) do d[k] = v end
+    for k, v in pairs(pers.diagnostics()) do d[k] = v end
+    for k, v in pairs(icon_store.diagnostics()) do d[k] = v end
     d.locations_source = d.locations > 0 and "zones" or (names.count("location") > 0 and "text" or "none")
     d.revision = chosen and chosen.name or "none"
     local ok, lang = pcall(obj.language, obj)
@@ -1765,6 +1866,7 @@ __mod["gen6.personal"] = function(...)
 -- table concatenated (pk3DS GameConfig). Accepted shapes: the last file (or the only one) with
 -- length % 0x50 == 0 and >= 722 entries, or >= 722 files of 0x50 bytes (file species + 1 is the
 -- entry of that species).
+local garc_entry = require("gen6.garc_entry")
 local M = {}
 
 M.CANDIDATE_PATHS = { "/a/1/9/5", "/a/1/9/6" }
@@ -1784,6 +1886,8 @@ function M.new(fb, opts)
   local self = {}
   local rates, forms, attempts = nil, nil, 0
   local whole_data, garc_data -- entry source: concatenated table, or the GARC itself
+  local first_reject = nil
+  local function reject(why) if not first_reject then first_reject = why end end
 
   local function form_info(e, out_forms, s)
     local idx = string.unpack("<I2", e, M.FORM_INDEX_OFFSET + 1)
@@ -1794,24 +1898,27 @@ function M.new(fb, opts)
   -- Returns a table species -> rate (1..721), a table species -> {index, count} and the source of
   -- the entries ("whole", string | "files"), or nil when data is not a personal table.
   local function validate(data)
-    local g = fb.codec.garc(data)
-    if type(g) ~= "table" or type(g.count) ~= "number" then return nil end
+    local g, gerr = fb.codec.garc(data)
+    if type(g) ~= "table" or type(g.count) ~= "number" then
+      reject("garc_rejected: " .. (tostring(gerr):gsub("[^%w _%.:%-]", "?"):sub(1, 40)))
+      return nil
+    end
     local out, fo = {}, {}
     local whole
-    local last = fb.codec.garc_file(data, g.count, 1)
+    local last = garc_entry.entry(fb.codec, data, g.count)
     if type(last) == "string" and #last % esize == 0 and #last // esize >= M.MIN_ENTRIES then whole = last end
     if whole then
       for s = 1, M.MIN_ENTRIES - 1 do
         local r = whole:byte(s * esize + goff + 1)
-        if not r or r > 5 then return nil end
+        if not r or r > 5 then reject("growth_invalid"); return nil end
         out[s] = r
         form_info(whole:sub(s * esize + 1, s * esize + esize), fo, s)
       end
       return out, fo, whole
     elseif g.count >= M.MIN_ENTRIES then
       for s = 1, M.MIN_ENTRIES - 1 do
-        local e = fb.codec.garc_file(data, s + 1, 1)
-        if type(e) ~= "string" or #e ~= esize then return nil end
+        local e = garc_entry.entry(fb.codec, data, s + 1)
+        if type(e) ~= "string" or #e ~= esize then reject("entry_size"); return nil end
         local r = e:byte(goff + 1)
         if r > 5 then return nil end
         out[s] = r
@@ -1819,6 +1926,7 @@ function M.new(fb, opts)
       end
       return out, fo, nil
     end
+    reject("table_shape")
     return nil
   end
 
@@ -1831,6 +1939,7 @@ function M.new(fb, opts)
     end
     for _, path in ipairs(paths) do
       local data = fb.rom.romfs(path)
+      if type(data) ~= "string" then reject("romfs_unreadable") end
       if type(data) == "string" then
         local r, fo, whole = validate(data)
         if r then
@@ -1872,7 +1981,7 @@ function M.new(fb, opts)
       local e = whole_data:sub(idx * esize + 1, idx * esize + esize)
       return #e == esize and e or nil
     end
-    local e = fb.codec.garc_file(garc_data, idx + 1, 1)
+    local e = garc_entry.entry(fb.codec, garc_data, idx + 1)
     return (type(e) == "string" and #e == esize) and e or nil
   end
 
@@ -1886,6 +1995,11 @@ function M.new(fb, opts)
     local e = raw_entry(idx)
     if not e then return nil, "no_form" end
     return { types = { e:byte(M.TYPE_OFFSET + 1), e:byte(M.TYPE_OFFSET + 2) }, growth = e:byte(goff + 1) }
+  end
+
+  -- Plain strings and numbers only.
+  function self.diagnostics()
+    return { personal_ok = rates and 1 or 0, personal_attempts = attempts, personal_first_rejection = first_reject or "none" }
   end
 
   -- Forget failures and cached values (e.g. after a game change).
@@ -1919,8 +2033,8 @@ local OFF = {
 }
 M.OFF = OFF
 
--- Language byte (PKHeX LanguageID) -> language code
-local LANG = { [1] = "ja", [2] = "en", [3] = "fr", [4] = "it", [5] = "de", [6] = "es",
+-- Language byte (PKHeX LanguageID; 6 is unused, 7 = Spanish) -> language code
+local LANG = { [1] = "ja", [2] = "en", [3] = "fr", [4] = "it", [5] = "de", [7] = "es",
   [8] = "ko", [9] = "zh-Hans", [10] = "zh-Hant" }
 M.LANGUAGES = LANG
 
@@ -2030,6 +2144,7 @@ __mod["gen6.text"] = function(...)
 --   line tab : at SDO+4, 8 bytes per line: i32 offset (relative to SDO), i16 length (UTF-16 units), 2 pad
 --   line i   : UTF-16LE words, each xor key, key = rotl16(key, 3); key(i) = 0x7C89 + i * 0x2983 (16 bit)
 --   markup   : 0x0010 = variable (count, code, count-1 args); 0x0000 ends the line
+local garc_entry = require("gen6.garc_entry")
 local M = {}
 
 M.GARC_BASE = 1 -- ORAS gametext of language index 0 is /a/0/7/1
@@ -2154,6 +2269,10 @@ function M.new(fb, opts)
   local found_species_file = nil
   local waited, fallback_used = 0, false
   local rounds, pause = 0, 0
+  local first_reject = nil
+
+  local function short(v) return (tostring(v):gsub("[^%w _%.:%-]", "?"):sub(1, 40)) end
+  local function reject(why) if not first_reject then first_reject = why end end
 
   local function candidates(lang)
     local out, seen = {}, {}
@@ -2187,9 +2306,13 @@ function M.new(fb, opts)
     end
     local idx = cands[cand]
     local d = fb.rom.romfs(M.GARC_DIR .. (M.GARC_BASE + idx))
-    if type(d) ~= "string" then return end
-    local ok, g = pcall(codec.garc, d)
-    if not ok or type(g) ~= "table" or type(g.count) ~= "number" or g.count < M.MIN_ENTRIES then return end
+    if type(d) ~= "string" then reject("romfs_unreadable"); return end
+    local ok, g, gerr = pcall(codec.garc, d)
+    if not ok or type(g) ~= "table" or type(g.count) ~= "number" then
+      reject("garc_rejected: " .. short(ok and gerr or g))
+      return
+    end
+    if g.count < M.MIN_ENTRIES then reject("garc_entries_" .. g.count); return end
     data, garc_count, found_species_file = d, g.count, nil
     kinds_left = {}
     for i, k in ipairs(M.KIND_ORDER) do kinds_left[i] = k end
@@ -2218,8 +2341,8 @@ function M.new(fb, opts)
   local function fetch_next()
     local kind = table.remove(kinds_left, 1)
     if kind then
-      local ok, raw = pcall(codec.garc_file, data, M.FILES[kind] + 1, 1)
-      if ok and type(raw) == "string" then
+      local raw = garc_entry.entry(codec, data, M.FILES[kind] + 1)
+      if type(raw) == "string" then
         local f = M.parse(raw)
         if f then files[kind] = f end
       end
@@ -2244,8 +2367,8 @@ function M.new(fb, opts)
     local last = math.min(search_pos + M.SEARCH_PER_STEP - 1, #search_list)
     for p = search_pos, last do
       local i = search_list[p]
-      local ok, raw = pcall(codec.garc_file, data, i + 1, 1)
-      if ok and type(raw) == "string" then
+      local raw = garc_entry.entry(codec, data, i + 1)
+      if type(raw) == "string" then
         local f = M.parse(raw)
         if f and M.species_plausible(f, true) then
           files.species, found_species_file = f, i
@@ -2296,7 +2419,8 @@ function M.new(fb, opts)
 
   -- Plain numbers and strings only: state, language index, lines per kind, species file index.
   function self.diagnostics()
-    local d = { text_state = state, text_language_index = cands and cands.current or -1, text_retries = rounds }
+    local d = { text_state = state, text_language_index = cands and cands.current or -1, text_retries = rounds,
+      text_first_rejection = first_reject or "none" }
     for _, k in ipairs(M.KIND_ORDER) do d["lines_" .. k] = files[k] and files[k].count or 0 end
     d.species_file_index = files.species and (found_species_file or M.FILES.species) or -1
     return d
@@ -2363,6 +2487,7 @@ __mod["gen6.zones"] = function(...)
 -- end of the encounter sub-file is the next larger offset (or the end of the pack).
 -- Scanning is a step-wise state machine (a bounded batch of entries per step). Only derived
 -- numbers are kept, in memory; no names (names come from the game text).
+local garc_entry = require("gen6.garc_entry")
 local M = {}
 
 M.GARC_PATH = "/a/0/1/3"
@@ -2535,12 +2660,9 @@ function M.new(fb, env)
   local function entry(i)
     local okf, e = pcall(codec.garc_file, data, i, 1)
     if not okf or type(e) ~= "string" or #e == 0 then return nil end
-    if e:byte(1) == 0x11 and codec.lz_decompress then
-      local ok, out = pcall(codec.lz_decompress, e)
-      if not ok or type(out) ~= "string" or #out > M.MAX_LZ_OUTPUT then return nil, "lz_failed" end
-      e = out
-    end
-    return e
+    local out, status = garc_entry.decompress(codec, e)
+    if status == "lz_failed" then return nil, "lz_failed" end
+    return out
   end
 
   local function build()

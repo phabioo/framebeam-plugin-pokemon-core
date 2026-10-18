@@ -7,6 +7,7 @@
 --   line tab : at SDO+4, 8 bytes per line: i32 offset (relative to SDO), i16 length (UTF-16 units), 2 pad
 --   line i   : UTF-16LE words, each xor key, key = rotl16(key, 3); key(i) = 0x7C89 + i * 0x2983 (16 bit)
 --   markup   : 0x0010 = variable (count, code, count-1 args); 0x0000 ends the line
+local garc_entry = require("gen6.garc_entry")
 local M = {}
 
 M.GARC_BASE = 1 -- ORAS gametext of language index 0 is /a/0/7/1
@@ -131,6 +132,10 @@ function M.new(fb, opts)
   local found_species_file = nil
   local waited, fallback_used = 0, false
   local rounds, pause = 0, 0
+  local first_reject = nil
+
+  local function short(v) return (tostring(v):gsub("[^%w _%.:%-]", "?"):sub(1, 40)) end
+  local function reject(why) if not first_reject then first_reject = why end end
 
   local function candidates(lang)
     local out, seen = {}, {}
@@ -164,9 +169,13 @@ function M.new(fb, opts)
     end
     local idx = cands[cand]
     local d = fb.rom.romfs(M.GARC_DIR .. (M.GARC_BASE + idx))
-    if type(d) ~= "string" then return end
-    local ok, g = pcall(codec.garc, d)
-    if not ok or type(g) ~= "table" or type(g.count) ~= "number" or g.count < M.MIN_ENTRIES then return end
+    if type(d) ~= "string" then reject("romfs_unreadable"); return end
+    local ok, g, gerr = pcall(codec.garc, d)
+    if not ok or type(g) ~= "table" or type(g.count) ~= "number" then
+      reject("garc_rejected: " .. short(ok and gerr or g))
+      return
+    end
+    if g.count < M.MIN_ENTRIES then reject("garc_entries_" .. g.count); return end
     data, garc_count, found_species_file = d, g.count, nil
     kinds_left = {}
     for i, k in ipairs(M.KIND_ORDER) do kinds_left[i] = k end
@@ -195,8 +204,8 @@ function M.new(fb, opts)
   local function fetch_next()
     local kind = table.remove(kinds_left, 1)
     if kind then
-      local ok, raw = pcall(codec.garc_file, data, M.FILES[kind] + 1, 1)
-      if ok and type(raw) == "string" then
+      local raw = garc_entry.entry(codec, data, M.FILES[kind] + 1)
+      if type(raw) == "string" then
         local f = M.parse(raw)
         if f then files[kind] = f end
       end
@@ -221,8 +230,8 @@ function M.new(fb, opts)
     local last = math.min(search_pos + M.SEARCH_PER_STEP - 1, #search_list)
     for p = search_pos, last do
       local i = search_list[p]
-      local ok, raw = pcall(codec.garc_file, data, i + 1, 1)
-      if ok and type(raw) == "string" then
+      local raw = garc_entry.entry(codec, data, i + 1)
+      if type(raw) == "string" then
         local f = M.parse(raw)
         if f and M.species_plausible(f, true) then
           files.species, found_species_file = f, i
@@ -273,7 +282,8 @@ function M.new(fb, opts)
 
   -- Plain numbers and strings only: state, language index, lines per kind, species file index.
   function self.diagnostics()
-    local d = { text_state = state, text_language_index = cands and cands.current or -1, text_retries = rounds }
+    local d = { text_state = state, text_language_index = cands and cands.current or -1, text_retries = rounds,
+      text_first_rejection = first_reject or "none" }
     for _, k in ipairs(M.KIND_ORDER) do d["lines_" .. k] = files[k] and files[k].count or 0 end
     d.species_file_index = files.species and (found_species_file or M.FILES.species) or -1
     return d

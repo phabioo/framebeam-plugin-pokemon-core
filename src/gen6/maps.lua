@@ -5,6 +5,7 @@
 -- machine: one step = one directory listing, one file read, or a bounded batch
 -- of entries, so no entry call nears the 500 ms / 20M instruction budget.
 local darc = require("gen6.darc")
+local garc_entry = require("gen6.garc_entry")
 
 local M = {}
 
@@ -162,8 +163,8 @@ function M.new(fb, game_id, revision_fn)
   local function examine(e, id)
     local b = e:byte(1)
     if (b == 0x10 or b == 0x11) and #e <= M.MAX_LZ_INPUT and codec.lz_decompress and #e > 4 then
-      local ok, out = pcall(codec.lz_decompress, e)
-      if ok and type(out) == "string" and #out <= M.MAX_LZ_OUTPUT then examine_plain(out, id) end
+      local out, status = garc_entry.decompress(codec, e, true)
+      if status == "lz" then examine_plain(out, id) end
       return
     end
     examine_plain(e, id)
@@ -303,10 +304,10 @@ function M.new(fb, game_id, revision_fn)
       e = codec.garc_file(d, entry, 1)
     end
     if type(e) ~= "string" then return nil, "unknown_map" end
-    local b = e:byte(1)
-    if (b == 0x10 or b == 0x11) and codec.lz_decompress and not M.bclim_size(e) then
-      e = codec.lz_decompress(e)
-      if type(e) ~= "string" then return nil, "unknown_map" end
+    if not M.bclim_size(e) then
+      local out, status = garc_entry.decompress(codec, e, true)
+      if status == "lz_failed" then return nil, "unknown_map" end
+      e = out
     end
     if sub then
       local list = darc.parse(e)

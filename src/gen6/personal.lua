@@ -12,6 +12,7 @@
 -- table concatenated (pk3DS GameConfig). Accepted shapes: the last file (or the only one) with
 -- length % 0x50 == 0 and >= 722 entries, or >= 722 files of 0x50 bytes (file species + 1 is the
 -- entry of that species).
+local garc_entry = require("gen6.garc_entry")
 local M = {}
 
 M.CANDIDATE_PATHS = { "/a/1/9/5", "/a/1/9/6" }
@@ -31,6 +32,8 @@ function M.new(fb, opts)
   local self = {}
   local rates, forms, attempts = nil, nil, 0
   local whole_data, garc_data -- entry source: concatenated table, or the GARC itself
+  local first_reject = nil
+  local function reject(why) if not first_reject then first_reject = why end end
 
   local function form_info(e, out_forms, s)
     local idx = string.unpack("<I2", e, M.FORM_INDEX_OFFSET + 1)
@@ -41,24 +44,27 @@ function M.new(fb, opts)
   -- Returns a table species -> rate (1..721), a table species -> {index, count} and the source of
   -- the entries ("whole", string | "files"), or nil when data is not a personal table.
   local function validate(data)
-    local g = fb.codec.garc(data)
-    if type(g) ~= "table" or type(g.count) ~= "number" then return nil end
+    local g, gerr = fb.codec.garc(data)
+    if type(g) ~= "table" or type(g.count) ~= "number" then
+      reject("garc_rejected: " .. (tostring(gerr):gsub("[^%w _%.:%-]", "?"):sub(1, 40)))
+      return nil
+    end
     local out, fo = {}, {}
     local whole
-    local last = fb.codec.garc_file(data, g.count, 1)
+    local last = garc_entry.entry(fb.codec, data, g.count)
     if type(last) == "string" and #last % esize == 0 and #last // esize >= M.MIN_ENTRIES then whole = last end
     if whole then
       for s = 1, M.MIN_ENTRIES - 1 do
         local r = whole:byte(s * esize + goff + 1)
-        if not r or r > 5 then return nil end
+        if not r or r > 5 then reject("growth_invalid"); return nil end
         out[s] = r
         form_info(whole:sub(s * esize + 1, s * esize + esize), fo, s)
       end
       return out, fo, whole
     elseif g.count >= M.MIN_ENTRIES then
       for s = 1, M.MIN_ENTRIES - 1 do
-        local e = fb.codec.garc_file(data, s + 1, 1)
-        if type(e) ~= "string" or #e ~= esize then return nil end
+        local e = garc_entry.entry(fb.codec, data, s + 1)
+        if type(e) ~= "string" or #e ~= esize then reject("entry_size"); return nil end
         local r = e:byte(goff + 1)
         if r > 5 then return nil end
         out[s] = r
@@ -66,6 +72,7 @@ function M.new(fb, opts)
       end
       return out, fo, nil
     end
+    reject("table_shape")
     return nil
   end
 
@@ -78,6 +85,7 @@ function M.new(fb, opts)
     end
     for _, path in ipairs(paths) do
       local data = fb.rom.romfs(path)
+      if type(data) ~= "string" then reject("romfs_unreadable") end
       if type(data) == "string" then
         local r, fo, whole = validate(data)
         if r then
@@ -119,7 +127,7 @@ function M.new(fb, opts)
       local e = whole_data:sub(idx * esize + 1, idx * esize + esize)
       return #e == esize and e or nil
     end
-    local e = fb.codec.garc_file(garc_data, idx + 1, 1)
+    local e = garc_entry.entry(fb.codec, garc_data, idx + 1)
     return (type(e) == "string" and #e == esize) and e or nil
   end
 
@@ -133,6 +141,11 @@ function M.new(fb, opts)
     local e = raw_entry(idx)
     if not e then return nil, "no_form" end
     return { types = { e:byte(M.TYPE_OFFSET + 1), e:byte(M.TYPE_OFFSET + 2) }, growth = e:byte(goff + 1) }
+  end
+
+  -- Plain strings and numbers only.
+  function self.diagnostics()
+    return { personal_ok = rates and 1 or 0, personal_attempts = attempts, personal_first_rejection = first_reject or "none" }
   end
 
   -- Forget failures and cached values (e.g. after a game change).

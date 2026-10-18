@@ -1,6 +1,6 @@
 # Roadmap
 
-Status: in progress: skeleton and ORAS adapter; v0.3.2 (v0.3.1 plus places that never stay empty: text fallback for `locations()`, names before lists, retried scans, `diagnostics()`; v0.3.1: fixes for zones and species names, and `locations()`) delivers live team stats, trainer/badges/money, location with names, encounter areas, battle state, wild encounters and names from the game text for Omega Ruby / Alpha Sapphire (v1.0 and v1.4); real-game verification of the derived and battle addresses is open (`docs/games/omega-ruby-alpha-sapphire.md`). Depends on FrameBeam plugin API v1 (0.11, planned); see https://github.com/phabioo/framebeam `docs/roadmap.md`.
+Status: in progress: skeleton and ORAS adapter; v0.3.3 (v0.3.2 plus the Spanish language byte, LZ11 GARC entries, icon/text/personal diagnostics; v0.3.2 = v0.3.1 plus places that never stay empty: text fallback for `locations()`, names before lists, retried scans, `diagnostics()`; v0.3.1: fixes for zones and species names, and `locations()`) delivers live team stats, trainer/badges/money, location with names, encounter areas, battle state, wild encounters and names from the game text for Omega Ruby / Alpha Sapphire (v1.0 and v1.4); real-game verification of the derived and battle addresses is open (`docs/games/omega-ruby-alpha-sapphire.md`). Depends on FrameBeam plugin API v1 (0.11, planned); see https://github.com/phabioo/framebeam `docs/roadmap.md`.
 
 ## v0.1 Omega Ruby / Alpha Sapphire (3DS, Gen 6)
 
@@ -9,6 +9,10 @@ Status: in progress: skeleton and ORAS adapter; v0.3.2 (v0.3.1 plus places that 
 - Asset extraction from the player's own game files into the local plugin cache (box icons, sprites, region map); nothing is stored in this repository.
 - Location/route table keyed by internal IDs, with self-recorded map coordinates; `provides` interface for other plugins.
 - Offsets documented per game in `docs/games/<game>.md`; verified locally by the maintainer with the FrameBeam developer mode.
+
+### Status v0.3.3 (ORAS)
+
+- v0.3.3: format audit fixes (2026-10-18): language byte 7 = Spanish (6 unused); GARC entries with first byte 0x11 are LZ11-decompressed in text, personal and icons through the shared `gen6.garc_entry` (zones and maps use it too); `diagnostics()` gains an icon archive probe (`icons_*`, `icon_e1/e25/e700_*`), `personal_*` and `text_first_rejection`; test GARCs use the real `CRAG` magic. Open: form icon index, Gen 6 palette BCLIM, real-game confirmation.
 
 ### Status v0.3.2 (ORAS)
 
