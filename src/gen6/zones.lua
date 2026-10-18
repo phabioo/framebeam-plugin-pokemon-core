@@ -7,6 +7,7 @@
 -- end of the encounter sub-file is the next larger offset (or the end of the pack).
 -- Scanning is a step-wise state machine (a bounded batch of entries per step). Only derived
 -- numbers are kept, in memory; no names (names come from the game text).
+local garc_entry = require("gen6.garc_entry")
 local M = {}
 
 M.GARC_PATH = "/a/0/1/3"
@@ -179,12 +180,9 @@ function M.new(fb, env)
   local function entry(i)
     local okf, e = pcall(codec.garc_file, data, i, 1)
     if not okf or type(e) ~= "string" or #e == 0 then return nil end
-    if e:byte(1) == 0x11 and codec.lz_decompress then
-      local ok, out = pcall(codec.lz_decompress, e)
-      if not ok or type(out) ~= "string" or #out > M.MAX_LZ_OUTPUT then return nil, "lz_failed" end
-      e = out
-    end
-    return e
+    local out, status = garc_entry.decompress(codec, e)
+    if status == "lz_failed" then return nil, "lz_failed" end
+    return out
   end
 
   local function build()

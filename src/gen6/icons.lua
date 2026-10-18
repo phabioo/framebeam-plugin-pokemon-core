@@ -6,6 +6,7 @@
 -- validated by content (see docs/games/omega-ruby-alpha-sapphire.md, "Icons").
 -- Discovery runs one small step per call (one directory listing or one
 -- candidate validation) so no entry call comes near the 500 ms / 20M budget.
+local garc_entry = require("gen6.garc_entry")
 local M = {}
 
 M.CANDIDATE_PATHS = {}      -- known paths are not sourced; discovery finds the file
@@ -19,6 +20,8 @@ M.MAX_STEPS = 4000
 M.INDEX_FILE = "icons/index.txt"      -- first line: RomFS path of the icon GARC
 M.OVERRIDE_FILE = "config/icon_garc.txt" -- optional: RomFS path to try first
 M.MAX_SPECIES = 721
+M.PROBE_PATH = "/a/0/9/1"   -- Project Pokemon ORAS file system: "971 box sprites" (diagnostics probe only)
+M.PROBE_ENTRIES = { 1, 25, 700 } -- 0-based GARC entries inspected by diagnostics()
 
 local function first_line(s)
   if type(s) ~= "string" then return nil end
@@ -44,17 +47,23 @@ function M.new(fb, personal)
   end
 
   -- Accepts the GARC when sampled entries decode to BCLIM images of an accepted size.
+  local first_reject = nil
+  local function reject(why) if not first_reject then first_reject = why end; return false end
+  local function short(v) return (tostring(v):gsub("[^%w _%.:%-]", "?"):sub(1, 40)) end
+
   local function validate(d)
-    local g = codec.garc(d)
-    if type(g) ~= "table" or type(g.count) ~= "number" then return false end
-    if g.count < M.MIN_ENTRIES or g.count > M.MAX_ENTRIES then return false end
+    local ok, g, gerr = pcall(codec.garc, d)
+    if not ok or type(g) ~= "table" or type(g.count) ~= "number" then
+      return reject("garc_rejected: " .. short(ok and gerr or g))
+    end
+    if g.count < M.MIN_ENTRIES or g.count > M.MAX_ENTRIES then return reject("garc_entries_" .. g.count) end
     for _, s in ipairs(M.SAMPLES) do
-      local e = codec.garc_file(d, s + 1, 1)
-      if type(e) ~= "string" then return false end
+      local e = garc_entry.entry(codec, d, s + 1)
+      if type(e) ~= "string" then return reject("entry_unreadable_" .. s) end
       local img = codec.bclim(e)
-      if type(img) ~= "table" or not M.SIZES[tostring(img.width) .. "x" .. tostring(img.height)] then
-        return false
-      end
+      if type(img) ~= "table" then return reject("bclim_failed_" .. s) end
+      local size = tostring(img.width) .. "x" .. tostring(img.height)
+      if not M.SIZES[size] then return reject("size_" .. size) end
     end
     return true
   end
@@ -119,6 +128,60 @@ function M.new(fb, personal)
     end
   end
 
+  -- Probe of the icon archive for diagnostics(): numbers and short strings only, no pixels, no names.
+  -- Read once and cached; the archive is the accepted one or, if none was accepted, M.PROBE_PATH.
+  local probe, probe_key
+  local function hex(b) return b and string.format("0x%02X", b) or "none" end
+  local function probe_entry(out, tag, d, n)
+    local ok, raw = pcall(codec.garc_file, d, n + 1, 1)
+    if not ok or type(raw) ~= "string" or #raw == 0 then out[tag .. "_first"] = "unreadable"; return end
+    out[tag .. "_first"] = hex(raw:byte(1))
+    local e, status = garc_entry.decompress(codec, raw)
+    out[tag .. "_lz11"] = status == "lz" and 1 or 0
+    if status == "lz_failed" then out[tag .. "_lz_failed"] = 1 end
+    out[tag .. "_size"] = #e
+    local fmt, w, h = -1, -1, -1
+    if #e >= 0x28 and e:sub(#e - 0x27, #e - 0x24) == "CLIM" then
+      w, h = string.unpack("<I2I2", e, #e - 0x28 + 0x1C + 1)
+      fmt = e:byte(#e - 0x28 + 0x20 + 1)
+    end
+    out[tag .. "_fmt"], out[tag .. "_w"], out[tag .. "_h"] = fmt, w, h
+    out[tag .. "_px0"] = #e >= 2 and string.format("0x%04X", string.unpack("<I2", e, 1)) or "none"
+  end
+
+  local function run_probe()
+    local out = { icons_state = state, icons_path = path or "none", icons_count = -1, icons_garc_ok = 0 }
+    if not can then return out end
+    local d = data
+    if not d then
+      local okr, r = pcall(fb.rom.romfs, M.PROBE_PATH)
+      d = okr and type(r) == "string" and r or nil
+      out.icons_path = M.PROBE_PATH .. (d and "" or " (unreadable)")
+    end
+    if d then
+      local ok, g, gerr = pcall(codec.garc, d)
+      if ok and type(g) == "table" and type(g.count) == "number" then
+        out.icons_garc_ok, out.icons_count = 1, g.count
+        for _, n in ipairs(M.PROBE_ENTRIES) do probe_entry(out, "icon_e" .. n, d, n) end
+      else
+        out.icons_garc_error = short(ok and gerr or g)
+      end
+    end
+    return out
+  end
+
+  function self.diagnostics()
+    if not can then return { icons_state = state } end
+    -- one probe per archive: the fixed probe path until discovery accepts another archive
+    local key = path or M.PROBE_PATH
+    if not probe or probe_key ~= key then probe, probe_key = run_probe(), key end
+    local out = {}
+    for k, v in pairs(probe) do out[k] = v end
+    out.icons_state = state
+    out.icons_first_rejection = first_reject or "none"
+    return out
+  end
+
   function self.found() return state == "done" end
   function self.state() return state end
   function self.path() return path end
@@ -127,6 +190,7 @@ function M.new(fb, personal)
   function self.reset()
     if can then state = "idle" end
     data, path, forced, dirs, cands, steps = nil, nil, {}, {}, {}, 0
+    probe, probe_key, first_reject = nil, nil, nil
   end
 
   local function entry_for(species, form)
@@ -153,7 +217,7 @@ function M.new(fb, personal)
       if state ~= "done" then return nil, "not_ready" end
     end
     local idx, exact = entry_for(species, form)
-    local blob = codec.garc_file(data, idx + 1, 1)
+    local blob = garc_entry.entry(codec, data, idx + 1)
     if type(blob) ~= "string" then return nil, "unknown_species" end
     local img = codec.bclim(blob)
     if type(img) ~= "table" then return nil, "unknown_species" end

@@ -217,3 +217,18 @@ t.case("v0.3.2: a text archive that is not mounted yet is retried, not final", f
   t.ok(load(store) or (function() for _ = 1, 100 do store.step() end return store.state() == "done" end)())
   t.eq(store.name("species", 2), "Sp2")
 end)
+
+t.case("v0.3.3: LZ11-compressed text entries are read", function()
+  local gt = tb.garc({
+    [98] = formats.lz11_literal(tb.build(lines("Sp", 30))), [14] = formats.lz11_literal(tb.build(lines("Mv", 20))),
+  })
+  local store = make({ ["/a/0/7/6"] = gt }, "de")
+  t.ok(load(store), "loaded")
+  t.eq(store.name("species", 3), "Sp3"); t.eq(store.name("move", 2), "Mv2")
+end)
+
+t.case("v0.3.3: diagnostics report the first rejection of a text archive", function()
+  local store = make({ ["/a/0/7/6"] = "GARC" .. string.rep("\0", 64) }, "de")
+  for _ = 1, 5 do store.step() end
+  t.ok(store.diagnostics().text_first_rejection:find("garc_rejected", 1, true))
+end)

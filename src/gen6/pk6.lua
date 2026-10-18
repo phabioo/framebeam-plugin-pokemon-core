@@ -17,8 +17,8 @@ local OFF = {
 }
 M.OFF = OFF
 
--- Language byte (PKHeX LanguageID) -> language code
-local LANG = { [1] = "ja", [2] = "en", [3] = "fr", [4] = "it", [5] = "de", [6] = "es",
+-- Language byte (PKHeX LanguageID; 6 is unused, 7 = Spanish) -> language code
+local LANG = { [1] = "ja", [2] = "en", [3] = "fr", [4] = "it", [5] = "de", [7] = "es",
   [8] = "ko", [9] = "zh-Hans", [10] = "zh-Hant" }
 M.LANGUAGES = LANG
 

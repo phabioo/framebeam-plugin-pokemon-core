@@ -164,3 +164,44 @@ t.case("interface info reports icons only once found", function()
   t.eq(api.info().features.icons, true)
   t.eq(api.icon(0), nil)
 end)
+
+local function lz_icon_garc(count, w, h)
+  local files = {}
+  for i = 0, count - 1 do
+    local px = string.char(i % 256, 0, 0, 255) .. string.rep("\0\0\0\255", w * h - 1)
+    files[#files + 1] = formats.lz11_literal(formats.bclim(w, h, px))
+  end
+  return formats.garc(files)
+end
+
+t.case("v0.3.3: LZ11-compressed icon entries are found and decoded", function()
+  local a = make({ romfs = { ["/a/0/9/1"] = lz_icon_garc(800, 40, 30) } })
+  t.ok(run_until(a, function() return a:features().icons end), "found")
+  local png = a:icon(25, 0)
+  t.ok(png and png:sub(1, 4) == "\137PNG")
+  local d = a:diagnostics()
+  t.eq({ d.icon_e25_lz11, d.icon_e25_first }, { 1, "0x11" })
+end)
+
+t.case("v0.3.3: diagnostics() probe of the icon archive: flat keys, no pixels", function()
+  local a = make({ romfs = { ["/a/0/9/1"] = icon_garc(800, 40, 30) } })
+  local d = a:diagnostics()
+  t.eq({ d.icons_state, d.icons_path, d.icons_count, d.icons_garc_ok }, { "idle", "/a/0/9/1", 800, 1 })
+  for _, n in ipairs({ 1, 25, 700 }) do
+    local p = "icon_e" .. n
+    t.eq({ d[p .. "_first"], d[p .. "_lz11"], d[p .. "_fmt"], d[p .. "_w"], d[p .. "_h"] },
+      { "0x" .. string.format("%02X", n % 256), 0, 9, 40, 30 }, p)
+    t.eq(type(d[p .. "_px0"]), "string")
+  end
+  t.eq(d.icons_first_rejection, "none")
+  for k, v in pairs(d) do t.ok(type(v) == "number" or type(v) == "string", k) end
+end)
+
+t.case("v0.3.3: diagnostics() names where icon reading stops", function()
+  local a = make({ romfs = { ["/a/0/9/1"] = "GARC" .. string.rep("\0", 64) } })
+  local d = a:diagnostics()
+  t.eq(d.icons_garc_ok, 0); t.eq(d.icons_count, -1)
+  t.ok(d.icons_garc_error ~= nil)
+  local b = make({ romfs = { ["/a/0/9/2"] = icon_garc(5, 40, 30) } })
+  t.eq(b:diagnostics().icons_path, "/a/0/9/1 (unreadable)")
+end)

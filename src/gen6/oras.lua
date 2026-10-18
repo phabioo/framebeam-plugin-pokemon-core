@@ -370,6 +370,8 @@ function M.attach(ctx)
   function obj:diagnostics()
     local d = zone_store.diagnostics()
     for k, v in pairs(names.diagnostics()) do d[k] = v end
+    for k, v in pairs(pers.diagnostics()) do d[k] = v end
+    for k, v in pairs(icon_store.diagnostics()) do d[k] = v end
     d.locations_source = d.locations > 0 and "zones" or (names.count("location") > 0 and "text" or "none")
     d.revision = chosen and chosen.name or "none"
     local ok, lang = pcall(obj.language, obj)
