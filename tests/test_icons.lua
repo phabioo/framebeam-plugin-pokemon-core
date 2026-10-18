@@ -83,7 +83,7 @@ t.case("icon maps species to entry, encodes PNG and caches it", function()
   t.eq(png:sub(1, 8), "\137PNG\r\n\26\n")
   t.eq({ string.unpack("<I2I2", png, 9) }, { 40, 30, 13 })
   t.eq(png:byte(13), 25)
-  t.eq(mock.cache_files["icons/25-0.png"], png)
+  t.eq(mock.cache_files["icons/25-0-" .. icons.CACHE_REV .. ".png"], png)
   local n = #reads
   t.eq(a:icon(25, 0), png)
   t.eq(#reads, n, "second call served from cache")
@@ -95,11 +95,11 @@ t.case("forms use the personal form index, otherwise the base icon", function()
   local a, mock = make()
   run_until(a, function() return a:features().icons end)
   t.eq(a:icon(25, 1):byte(13), 722 % 256)
-  t.ok(mock.cache_files["icons/25-1.png"])
+  t.ok(mock.cache_files["icons/25-1-" .. icons.CACHE_REV .. ".png"])
   t.eq(a:icon(25, 2):byte(13), 723 % 256)
   local base = a:icon(25, 3) -- FormeCount is 3: form 3 does not exist
   t.eq(base:byte(13), 25)
-  t.eq(mock.cache_files["icons/25-3.png"], nil, "fallback is not cached under the form key")
+  t.eq(mock.cache_files["icons/25-3-" .. icons.CACHE_REV .. ".png"], nil, "fallback is not cached under the form key")
   t.eq(a:icon(4, 1):byte(13), 4) -- species without extra forms
 end)
 

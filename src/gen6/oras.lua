@@ -26,8 +26,9 @@ M.NAME_START_TICK, M.NAME_STEP_EVERY = 20, 4   -- game text loading (ticks % 4 =
 M.ZONE_START_TICK, M.ZONE_STEP_EVERY = 30, 4   -- zone scan (ticks % 4 == 1)
 M.ICON_START_TICK = 90 -- ticks before icon discovery starts
 M.ICON_STEP_EVERY = 8  -- ticks between discovery steps
-M.MAP_START_TICK = 120 -- map scan starts later; steps are offset from icon steps
-M.MAP_STEP_EVERY = 8 -- steps fall on the odd half of the icon cadence
+M.MAP_START_TICK = 120 -- map scan starts later; steps are offset from the other loaders
+M.MAP_STEP_EVERY = 4 -- ticks % 4 == 3 (names 2, zones 1, icons 0 mod 8); a step is time-budgeted (maps.STEP_BUDGET_MS)
+M.PERSONAL_START_TICK, M.PERSONAL_STEP_EVERY = 60, 30 -- personal table (growth, types) is loaded in the background
 M.DETECT_EVERY = 5
 M.CROSSCHECK_EVERY = 30
 M.ORIGIN_AS, M.ORIGIN_OR = 26, 27 -- PKHeX GameVersion (X 24, Y 25)
@@ -311,7 +312,8 @@ function M.attach(ctx)
     if not chosen and ticks % M.DETECT_EVERY == 0 then detect() end
     if ticks >= M.NAME_START_TICK and ticks % M.NAME_STEP_EVERY == 2 then names.step() end
     if ticks >= M.ZONE_START_TICK and ticks % M.ZONE_STEP_EVERY == 1 then zone_store.step() end
-    if ticks >= M.MAP_START_TICK and ticks % M.MAP_STEP_EVERY == M.MAP_STEP_EVERY // 2 and map_store.state() ~= "done" then
+    if ticks >= M.PERSONAL_START_TICK and ticks % M.PERSONAL_STEP_EVERY == 0 then pers.growth_rate(1) end
+    if ticks >= M.MAP_START_TICK and ticks % M.MAP_STEP_EVERY == 3 then
       map_store.step()
     end
     if ticks >= M.ICON_START_TICK and ticks % M.ICON_STEP_EVERY == 0 and icon_store.state() ~= "done" then
@@ -339,6 +341,7 @@ function M.attach(ctx)
   end
 
   function obj:icon(species, form) return icon_store.icon(species, form) end
+  function obj:icon_variants(species, form) return icon_store.icon_variants(species, form) end
   function obj:map_candidates() return map_store.candidates() end
   function obj:map_image(id) return map_store.image(id) end
   function obj:map_selected() return map_store.selected() end
@@ -372,6 +375,7 @@ function M.attach(ctx)
     for k, v in pairs(names.diagnostics()) do d[k] = v end
     for k, v in pairs(pers.diagnostics()) do d[k] = v end
     for k, v in pairs(icon_store.diagnostics()) do d[k] = v end
+    for k, v in pairs(map_store.diagnostics()) do d[k] = v end
     d.locations_source = d.locations > 0 and "zones" or (names.count("location") > 0 and "text" or "none")
     d.revision = chosen and chosen.name or "none"
     local ok, lang = pcall(obj.language, obj)

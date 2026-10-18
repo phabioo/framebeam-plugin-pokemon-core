@@ -82,7 +82,7 @@ t.case("scan finds plain, LZ11, DARC and loose candidates sorted by area", funct
   t.eq(ids, { "/a/0/0/0#3", "/a/0/0/1#1", "/a/0/0/0#4/timg/map.bclim", "/a/0/0/0#1" })
   t.eq(list[1], { id = "/a/0/0/0#3", w = 512, h = 256 })
   t.eq(store.found(), true)
-  t.eq(mock.cache_files["map/index.txt"]:match("^[^\n]+"), "complete")
+  t.eq(mock.cache_files["map/index.txt"]:match("^[^\n]+"), "complete " .. maps.INDEX_REV)
 end)
 
 t.case("files over 32 MiB are skipped and nothing found means no feature", function()
@@ -95,6 +95,8 @@ t.case("files over 32 MiB are skipped and nothing found means no feature", funct
 end)
 
 t.case("each scan step reads at most one file", function()
+  local saved = maps.STEP_BUDGET_MS
+  maps.STEP_BUDGET_MS = 0 -- one unit per step
   local store, _, reads = make()
   for _ = 1, 5000 do
     local n = #reads
@@ -102,6 +104,7 @@ t.case("each scan step reads at most one file", function()
     t.ok(#reads - n <= 1)
     if store.state() == "done" then break end
   end
+  maps.STEP_BUDGET_MS = saved
 end)
 
 t.case("scan resumes from saved progress without rereading finished files", function()
