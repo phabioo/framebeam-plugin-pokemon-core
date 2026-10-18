@@ -2,7 +2,7 @@
 local M = {}
 
 local METHODS = { "team", "box", "box_count", "location", "battle", "encounters", "badges", "trainer", "name",
-  "species_info", "areas", "locations", "zone_info", "icon", "map_candidates", "map_image", "map_selected", "diagnostics" }
+  "species_info", "areas", "locations", "zone_info", "icon", "icon_variants", "map_candidates", "map_image", "map_selected", "diagnostics" }
 local FEATURE = {
   team = "team", box = "box", location = "location",
   battle = "battle", encounters = "encounters", badges = "badges", trainer = "trainer", name = "names",

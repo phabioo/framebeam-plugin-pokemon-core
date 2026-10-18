@@ -138,7 +138,7 @@ __mod["core.interface"] = function(...)
 local M = {}
 
 local METHODS = { "team", "box", "box_count", "location", "battle", "encounters", "badges", "trainer", "name",
-  "species_info", "areas", "locations", "zone_info", "icon", "map_candidates", "map_image", "map_selected", "diagnostics" }
+  "species_info", "areas", "locations", "zone_info", "icon", "icon_variants", "map_candidates", "map_image", "map_selected", "diagnostics" }
 local FEATURE = {
   team = "team", box = "box", location = "location",
   battle = "battle", encounters = "encounters", badges = "badges", trainer = "trainer", name = "names",
@@ -382,6 +382,7 @@ __mod["gen6.icons"] = function(...)
 -- Discovery runs one small step per call (one directory listing or one
 -- candidate validation) so no entry call comes near the 500 ms / 20M budget.
 local garc_entry = require("gen6.garc_entry")
+local pal_bclim = require("gen6.pal_bclim")
 local M = {}
 
 M.CANDIDATE_PATHS = {}      -- known paths are not sourced; discovery finds the file
@@ -395,6 +396,7 @@ M.MAX_STEPS = 4000
 M.INDEX_FILE = "icons/index.txt"      -- first line: RomFS path of the icon GARC
 M.OVERRIDE_FILE = "config/icon_garc.txt" -- optional: RomFS path to try first
 M.MAX_SPECIES = 721
+M.CACHE_REV = "r2"  -- part of the PNG cache key: bump when the decoding changes (v0.3.3 cached wrong PNGs)
 M.PROBE_PATH = "/a/0/9/1"   -- Project Pokemon ORAS file system: "971 box sprites" (diagnostics probe only)
 M.PROBE_ENTRIES = { 1, 25, 700 } -- 0-based GARC entries inspected by diagnostics()
 
@@ -522,6 +524,20 @@ function M.new(fb, personal)
     end
     out[tag .. "_fmt"], out[tag .. "_w"], out[tag .. "_h"] = fmt, w, h
     out[tag .. "_px0"] = #e >= 2 and string.format("0x%04X", string.unpack("<I2", e, 1)) or "none"
+    out[tag .. "_layout"] = pal_bclim.layout(e) or "none"
+    local info = pal_bclim.inspect(e)
+    if info then
+      local pal, idx = {}, {}
+      for _, v in ipairs(info.pal) do pal[#pal + 1] = string.format("%04X", v) end
+      for _, v in ipairs(info.idx) do idx[#idx + 1] = string.format("%02X", v) end
+      out[tag .. "_count"] = info.count
+      out[tag .. "_pal"] = table.concat(pal, ",")
+      out[tag .. "_idx"] = table.concat(idx, ",")
+      out[tag .. "_idxbytes"] = info.idx_bytes
+    end
+    local head = {}
+    for i = 1, math.min(16, #e) do head[i] = string.format("%02X", e:byte(i)) end
+    out[tag .. "_head"] = table.concat(head, " ")
   end
 
   local function run_probe()
@@ -575,17 +591,9 @@ function M.new(fb, personal)
     return species, false
   end
 
-  -- PNG string, or nil, "not_ready" | "unsupported" | "unknown_species".
-  function self.icon(species, form)
-    if math.type(species) ~= "integer" or species < 1 or species > M.MAX_SPECIES then
-      return nil, "unknown_species"
-    end
-    if form == nil then form = 0 end
-    if math.type(form) ~= "integer" or form < 0 then return nil, "unknown_species" end
-    local key = string.format("icons/%d-%d.png", species, form)
+  -- Blob of a species form, or nil, reason.
+  local function blob_for(species, form)
     if state == "unsupported" then return nil, "unsupported" end
-    local hit = read_cache(key)
-    if hit then return hit end
     if state ~= "done" then
       self.step()
       if state == "failed" then return nil, "unsupported" end
@@ -594,12 +602,61 @@ function M.new(fb, personal)
     local idx, exact = entry_for(species, form)
     local blob = garc_entry.entry(codec, data, idx + 1)
     if type(blob) ~= "string" then return nil, "unknown_species" end
-    local img = codec.bclim(blob)
+    return blob, exact
+  end
+
+  local function valid_args(species, form)
+    if math.type(species) ~= "integer" or species < 1 or species > M.MAX_SPECIES then return false end
+    if form == nil then form = 0 end
+    if math.type(form) ~= "integer" or form < 0 then return false end
+    return true, form
+  end
+
+  -- PNG string, or nil, "not_ready" | "unsupported" | "unknown_species".
+  -- Palette / plain 16-bit data of the Gen 6 icons is decoded in Lua (gen6.pal_bclim, default
+  -- variant pal_bclim.DEFAULT_VARIANT); every other BCLIM goes through fb.codec.bclim.
+  function self.icon(species, form)
+    local ok, f = valid_args(species, form)
+    if not ok then return nil, "unknown_species" end
+    form = f
+    local key = string.format("icons/%d-%d-%s.png", species, form, M.CACHE_REV)
+    if state == "unsupported" then return nil, "unsupported" end
+    local hit = read_cache(key)
+    if hit then return hit end
+    local blob, exact = blob_for(species, form)
+    if not blob then return nil, exact end
+    local img = pal_bclim.decode_auto(blob)
+    if type(img) ~= "table" then img = codec.bclim(blob) end
     if type(img) ~= "table" then return nil, "unknown_species" end
     local png = codec.png(img)
     if type(png) ~= "string" then return nil, "unknown_species" end
     if exact then pcall(fb.cache.write, key, png) end
     return png
+  end
+
+  -- Up to 5 decodings of the species icon to compare: { label, desc, png } for the labels A..D
+  -- (palette readings, see pal_bclim.VARIANTS) and E (plain tiled RGBA5551). Variants that cannot
+  -- be decoded for this data are left out. nil, "not_ready" | "unsupported" | "unknown_species".
+  function self.icon_variants(species, form)
+    local ok, f = valid_args(species, form)
+    if not ok then return nil, "unknown_species" end
+    local blob, err = blob_for(species, f)
+    if not blob then return nil, err end
+    local layout = pal_bclim.layout(blob)
+    if layout == nil then return nil, "unsupported" end
+    -- consumers may show only the first 4 entries: for plain 16-bit data E (the likely reading) goes first
+    local order = pal_bclim.ORDER
+    if layout == "plain16" then order = { "E", "A", "B", "C", "D" } end
+    local out = {}
+    for _, label in ipairs(order) do
+      local img = pal_bclim.decode_variant(blob, label)
+      local png = type(img) == "table" and codec.png(img)
+      if type(png) == "string" then
+        out[#out + 1] = { label = label, desc = pal_bclim.VARIANTS[label].desc, png = png }
+      end
+    end
+    if #out == 0 then return nil, "unsupported" end
+    return out
   end
 
   return self
@@ -613,8 +670,11 @@ __mod["gen6.maps"] = function(...)
 -- runtime (plain files, GARC entries, LZ10/LZ11-wrapped entries, DARC archives)
 -- and converts a chosen one to PNG. No image is shipped; the index and PNGs are
 -- derived data in the plugin cache (fb.cache). Scanning is a resumable state
--- machine: one step = one directory listing, one file read, or a bounded batch
--- of entries, so no entry call nears the 500 ms / 20M instruction budget.
+-- machine. One unit = one directory listing, one archive open, or a bounded batch of entries;
+-- one step() runs units until a wall-clock budget (STEP_BUDGET_MS, fb.clock) is used up, so no
+-- entry call nears the 500 ms / 20M instruction budget. The scan always ends in `done` (a list,
+-- possibly empty) or `failed` (with a reason): a throwing entry or archive is skipped and counted
+-- (never retried), and MAX_SCAN_MS bounds the whole scan.
 local darc = require("gen6.darc")
 local garc_entry = require("gen6.garc_entry")
 
@@ -624,10 +684,18 @@ M.ROOT = "/a"
 M.MAX_FILE_SIZE = 32 * 1024 * 1024  -- larger files are skipped
 M.MIN_FILE_SIZE = 64
 M.MIN_W, M.MIN_H = 256, 128         -- candidate threshold (decoded size = BCLIM header size)
-M.ENTRIES_PER_STEP = 16
+M.ENTRIES_PER_STEP = 16             -- entries per unit
+M.STEP_BUDGET_MS = 25               -- wall-clock budget of one step() (units run until it is used)
+M.MAX_UNITS_PER_STEP = 200          -- hard cap when fb.clock is missing or stands still
+M.MAX_SCAN_MS = 30 * 60 * 1000      -- scan time limit (fb.clock): then `failed` with the partial list
+-- Entries whose decoded size is below this cannot hold a candidate (4-bit texture of MIN_W x MIN_H
+-- plus the footer): they are skipped without decompressing (LZ header) or decoding.
+M.MIN_DECODED = (256 * 128) // 2 + 40
+M.INDEX_REV = "3"                   -- cache format revision; other revisions are rescanned
 M.MAX_ENTRIES_PER_FILE = 5000
 M.MAX_LZ_INPUT = 2 * 1024 * 1024
 M.MAX_LZ_OUTPUT = 4 * 1024 * 1024
+M.MAX_ERRORS = 500                  -- scan errors tolerated before `failed`
 M.MAX_CANDIDATES = 2000             -- kept in the index
 M.LIST_CAP = 40                     -- returned by map_candidates
 M.MAX_PNG = 1024 * 1024             -- interface value limit
@@ -692,13 +760,32 @@ function M.parse_id(id)
   return path, tonumber(entry), sub
 end
 
+-- Short, log-safe text.
+local function short(v) return (tostring(v):gsub("[^%w _%.:#/%-]", "?"):sub(1, 60)) end
+
 function M.new(fb, game_id, revision_fn)
   local self = {}
   local codec = fb.codec
-  local can = fb.rom and fb.rom.romfs and fb.rom.romfs_list and codec and codec.png and codec.bclim
-    and fb.cache and true or false
-  local state = can and "idle" or "unsupported" -- idle | dirs | files | done | unsupported
+  local missing
+  if not (fb.rom and fb.rom.romfs) then missing = "fb.rom.romfs"
+  elseif not fb.rom.romfs_list then missing = "fb.rom.romfs_list"
+  elseif not codec then missing = "fb.codec"
+  elseif not codec.png then missing = "codec.png"
+  elseif not codec.bclim then missing = "codec.bclim"
+  elseif not fb.cache then missing = "fb.cache" end
+  -- idle | dirs | files | done | failed | unsupported
+  local state = missing and "unsupported" or "idle"
   local dirs, files, fidx, cands, cur = {}, {}, 0, {}, nil
+  local first_reject = missing and ("missing_" .. missing) or nil
+  local fail_reason
+  local stat = { entries = 0, errors = 0, steps = 0, started = nil, elapsed = 0, archives_skipped = 0 }
+
+  local function reject(why) if not first_reject then first_reject = short(why) end end
+  local function clock()
+    if type(fb.clock) ~= "function" then return nil end
+    local ok, v = pcall(fb.clock)
+    if ok and type(v) == "number" then return v end
+  end
 
   local function cread(name)
     local ok, v = pcall(fb.cache.read, name)
@@ -707,27 +794,36 @@ function M.new(fb, game_id, revision_fn)
   local function cwrite(name, data) pcall(fb.cache.write, name, data) end
 
   local function save_index(complete)
-    local lines = { complete and "complete" or "partial" }
+    local lines = { (complete and "complete " or "partial ") .. M.INDEX_REV }
     for _, c in ipairs(cands) do lines[#lines + 1] = c.id .. "\t" .. c.w .. "\t" .. c.h end
     cwrite(M.INDEX, table.concat(lines, "\n") .. "\n")
   end
 
   local function load_state()
     local idx = cread(M.INDEX)
+    local usable = false
     if idx then
       local first = true
+      local loaded = {}
       for line in idx:gmatch("[^\n]+") do
         if first then
           first = false
-          if line == "complete" then state = "done" end
+          local kind, rev = line:match("^(%a+) (%w+)$")
+          if rev == M.INDEX_REV and (kind == "complete" or kind == "partial") then
+            usable = true
+            if kind == "complete" then state = "done" end
+          else
+            break -- index of an older revision (or unknown): rescan
+          end
         else
           local id, w, h = line:match("^(.-)\t(%d+)\t(%d+)$")
-          if id then cands[#cands + 1] = { id = id, w = tonumber(w), h = tonumber(h) } end
+          if id then loaded[#loaded + 1] = { id = id, w = tonumber(w), h = tonumber(h) } end
         end
       end
+      if usable then cands = loaded end
       if state == "done" then return end
     end
-    local list = cread(M.FILES)
+    local list = usable and cread(M.FILES)
     if list then
       for line in list:gmatch("[^\n]+") do files[#files + 1] = line end
       fidx = math.min(tonumber(cread(M.PROGRESS) or "0") or 0, #files)
@@ -771,41 +867,65 @@ function M.new(fb, game_id, revision_fn)
     end
   end
 
+  -- Decoded size announced by an LZ10/LZ11 header, or nil.
+  local function lz_size(e)
+    if #e < 8 then return nil end
+    local n = string.unpack("<I3", e, 2)
+    if n == 0 then n = string.unpack("<I4", e, 5) end
+    return n
+  end
+
   local function examine(e, id)
     local b = e:byte(1)
-    if (b == 0x10 or b == 0x11) and #e <= M.MAX_LZ_INPUT and codec.lz_decompress and #e > 4 then
-      local out, status = garc_entry.decompress(codec, e, true)
-      if status == "lz" then examine_plain(out, id) end
+    if (b == 0x10 or b == 0x11) and #e > 4 and codec.lz_decompress then
+      -- the header tells the decoded size: entries that cannot hold a candidate are not decompressed
+      local n = lz_size(e)
+      if #e <= M.MAX_LZ_INPUT and n and n >= M.MIN_DECODED and n <= M.MAX_LZ_OUTPUT then
+        local out, status = garc_entry.decompress(codec, e, true)
+        if status == "lz" then examine_plain(out, id) else reject("lz_failed " .. id) end
+      end
       return
     end
-    examine_plain(e, id)
+    if #e >= M.MIN_DECODED then examine_plain(e, id) end
   end
 
   local function open_file(path)
     local d = fb.rom.romfs(path)
-    if type(d) ~= "string" then return nil end
+    if type(d) ~= "string" then reject("romfs_unreadable " .. path); return nil end
     local okg, g = false, nil
     if codec.garc and codec.garc_file then okg, g = pcall(codec.garc, d) end
     if okg and type(g) == "table" and type(g.count) == "number" and g.count >= 1 then
-      return { path = path, data = d, garc = true, count = math.min(g.count, M.MAX_ENTRIES_PER_FILE), next = 1 }
+      return { path = path, data = d, garc = true, count = math.min(g.count, M.MAX_ENTRIES_PER_FILE), next = 1, g = g }
     end
     return { path = path, data = d, garc = false, count = 1, next = 1 }
   end
 
+  -- One bounded batch of entries; `next` moves first, so a throwing entry is never retried.
   local function process(c)
     local last = math.min(c.next + M.ENTRIES_PER_STEP - 1, c.count)
     for i = c.next, last do
-      local e = c.data
-      if c.garc then e = codec.garc_file(c.data, i, 1) end
-      if type(e) == "string" and #e >= 40 then examine(e, c.path .. "#" .. i) end
+      c.next = i + 1
+      stat.entries = stat.entries + 1
+      local ok, err = pcall(function()
+        local e = c.data
+        if c.garc then
+          local f = c.g.files and c.g.files[i] and c.g.files[i][1]
+          if type(f) == "table" and type(f.length) == "number" and f.length < 40 then return end
+          e = codec.garc_file(c.data, i, 1)
+        end
+        if type(e) == "string" and #e >= 40 then examine(e, c.path .. "#" .. i) end
+      end)
+      if not ok then
+        stat.errors = stat.errors + 1
+        reject("entry_error " .. c.path .. "#" .. i .. ": " .. tostring(err))
+      end
     end
-    c.next = last + 1
     return c.next > c.count
   end
 
   local function scan_dir(dir)
     local list = fb.rom.romfs_list(dir)
-    if type(list) ~= "table" then return end
+    if type(list) ~= "table" then reject("list_failed " .. dir); return end
     for _, e in ipairs(list) do
       local full = dir .. "/" .. tostring(e.name)
       if e.dir then
@@ -828,6 +948,13 @@ function M.new(fb, game_id, revision_fn)
     if fb.log and fb.log.info then fb.log.info("map scan finished, " .. #cands .. " candidates") end
   end
 
+  local function fail(why)
+    state, cur, fail_reason = "failed", nil, short(why)
+    save_index(false)
+    if fb.log and fb.log.error then fb.log.error("map scan failed: " .. tostring(why)) end
+  end
+
+  -- One unit of work.
   local function advance()
     if state == "idle" then load_state() end
     if state == "idle" then return end
@@ -859,8 +986,14 @@ function M.new(fb, game_id, revision_fn)
       elseif fidx >= #files then
         finish()
       else
-        local c = open_file(files[fidx + 1])
-        if c then cur = c else fidx = fidx + 1 end
+        local path = files[fidx + 1]
+        local ok, c = pcall(open_file, path)
+        if not ok then
+          reject("archive_error " .. path .. ": " .. tostring(c))
+          stat.errors = stat.errors + 1
+          c = nil
+        end
+        if c then cur = c else fidx = fidx + 1; stat.archives_skipped = stat.archives_skipped + 1 end
       end
     end
   end
@@ -868,22 +1001,68 @@ function M.new(fb, game_id, revision_fn)
   -- Restore the saved index/progress at once (cheap cache reads only).
   if state == "idle" then pcall(load_state) end
 
-  -- One bounded scan step. Never raises.
+  local function terminal() return state == "done" or state == "failed" or state == "unsupported" end
+
+  -- One bounded scan step: units until STEP_BUDGET_MS (fb.clock) is used. Never raises.
   function self.step()
-    if state == "done" or state == "unsupported" then return end
-    local ok, err = pcall(advance)
-    if not ok then
-      state = "unsupported"
-      if fb.log and fb.log.error then fb.log.error("map scan failed: " .. tostring(err)) end
+    if terminal() then return end
+    stat.steps = stat.steps + 1
+    local t0 = clock()
+    if t0 and not stat.started then stat.started = t0 end
+    for _ = 1, M.MAX_UNITS_PER_STEP do
+      local ok, err = pcall(advance)
+      if not ok then
+        -- advance() itself raised outside the per-entry/per-archive guards (directory listing, cache,
+        -- sort): skip the work item that raised, never loop on it
+        stat.errors = stat.errors + 1
+        reject("scan_error: " .. tostring(err))
+        if state == "dirs" then
+          -- the directory was already taken from the queue
+        elseif state == "files" then
+          if cur then cur = nil end
+          fidx = fidx + 1
+          stat.archives_skipped = stat.archives_skipped + 1
+        else
+          fail("scan_error: " .. tostring(err))
+        end
+        if stat.errors > M.MAX_ERRORS then fail("too_many_errors") end
+      end
+      if terminal() then return end
+      local now = clock()
+      if now then
+        stat.elapsed = now - (stat.started or now)
+        if stat.elapsed > M.MAX_SCAN_MS then fail("time_limit"); return end
+        if t0 and now - t0 >= M.STEP_BUDGET_MS then return end
+      end
     end
   end
 
   function self.state() return state end
-  function self.found() return state == "done" and #cands > 0 end
+  function self.found() return (state == "done" or state == "failed") and #cands > 0 end
+
+  function self.diagnostics()
+    return {
+      map_state = state,
+      map_archives_scanned = fidx,
+      map_archives_total = #files,
+      map_archives_skipped = stat.archives_skipped,
+      map_dirs_pending = #dirs,
+      map_entries_scanned = stat.entries,
+      map_errors = stat.errors,
+      map_candidates = #cands,
+      map_current = cur and cur.path or "none",
+      map_first_rejection = first_reject or "none",
+      map_fail_reason = fail_reason or "none",
+      map_steps = stat.steps,
+      map_elapsed_ms = stat.elapsed,
+    }
+  end
 
   function self.candidates()
     if state == "unsupported" then return nil, "unsupported" end
-    if state ~= "done" then self.step(); return nil, "not_ready" end
+    if not terminal() then self.step() end
+    if state == "failed" and #cands == 0 then return nil, "unsupported" end
+    if state ~= "done" and state ~= "failed" then return nil, "not_ready" end
     local out = {}
     for i = 1, math.min(#cands, M.LIST_CAP) do
       local c = cands[i]
@@ -902,7 +1081,7 @@ function M.new(fb, game_id, revision_fn)
       if #hit > M.MAX_PNG then return nil, "too_large" end
       return hit
     end
-    if state ~= "done" then self.step(); return nil, "not_ready" end
+    if state ~= "done" and state ~= "failed" then self.step(); return nil, "not_ready" end
     local known = false
     for _, c in ipairs(cands) do if c.id == id then known = true; break end end
     if not known then return nil, "unknown_map" end
@@ -978,8 +1157,9 @@ M.NAME_START_TICK, M.NAME_STEP_EVERY = 20, 4   -- game text loading (ticks % 4 =
 M.ZONE_START_TICK, M.ZONE_STEP_EVERY = 30, 4   -- zone scan (ticks % 4 == 1)
 M.ICON_START_TICK = 90 -- ticks before icon discovery starts
 M.ICON_STEP_EVERY = 8  -- ticks between discovery steps
-M.MAP_START_TICK = 120 -- map scan starts later; steps are offset from icon steps
-M.MAP_STEP_EVERY = 8 -- steps fall on the odd half of the icon cadence
+M.MAP_START_TICK = 120 -- map scan starts later; steps are offset from the other loaders
+M.MAP_STEP_EVERY = 4 -- ticks % 4 == 3 (names 2, zones 1, icons 0 mod 8); a step is time-budgeted (maps.STEP_BUDGET_MS)
+M.PERSONAL_START_TICK, M.PERSONAL_STEP_EVERY = 60, 30 -- personal table (growth, types) is loaded in the background
 M.DETECT_EVERY = 5
 M.CROSSCHECK_EVERY = 30
 M.ORIGIN_AS, M.ORIGIN_OR = 26, 27 -- PKHeX GameVersion (X 24, Y 25)
@@ -1263,7 +1443,8 @@ function M.attach(ctx)
     if not chosen and ticks % M.DETECT_EVERY == 0 then detect() end
     if ticks >= M.NAME_START_TICK and ticks % M.NAME_STEP_EVERY == 2 then names.step() end
     if ticks >= M.ZONE_START_TICK and ticks % M.ZONE_STEP_EVERY == 1 then zone_store.step() end
-    if ticks >= M.MAP_START_TICK and ticks % M.MAP_STEP_EVERY == M.MAP_STEP_EVERY // 2 and map_store.state() ~= "done" then
+    if ticks >= M.PERSONAL_START_TICK and ticks % M.PERSONAL_STEP_EVERY == 0 then pers.growth_rate(1) end
+    if ticks >= M.MAP_START_TICK and ticks % M.MAP_STEP_EVERY == 3 then
       map_store.step()
     end
     if ticks >= M.ICON_START_TICK and ticks % M.ICON_STEP_EVERY == 0 and icon_store.state() ~= "done" then
@@ -1291,6 +1472,7 @@ function M.attach(ctx)
   end
 
   function obj:icon(species, form) return icon_store.icon(species, form) end
+  function obj:icon_variants(species, form) return icon_store.icon_variants(species, form) end
   function obj:map_candidates() return map_store.candidates() end
   function obj:map_image(id) return map_store.image(id) end
   function obj:map_selected() return map_store.selected() end
@@ -1324,6 +1506,7 @@ function M.attach(ctx)
     for k, v in pairs(names.diagnostics()) do d[k] = v end
     for k, v in pairs(pers.diagnostics()) do d[k] = v end
     for k, v in pairs(icon_store.diagnostics()) do d[k] = v end
+    for k, v in pairs(map_store.diagnostics()) do d[k] = v end
     d.locations_source = d.locations > 0 and "zones" or (names.count("location") > 0 and "text" or "none")
     d.revision = chosen and chosen.name or "none"
     local ok, lang = pcall(obj.language, obj)
@@ -1846,6 +2029,218 @@ function M.new(fb, env)
   end
 
   return self
+end
+
+return M
+
+end
+__mod["gen6.pal_bclim"] = function(...)
+-- Gen 6 palette BCLIM decoder in Lua (box icons). The Player's fb.codec.bclim decodes this variant
+-- too, but with one fixed set of choices (RGBA5551 colours, low nibble first) that did not give a
+-- usable picture on a real Omega Ruby (v0.3.3 field report). The choices are parameters here so
+-- the maintainer can compare variants (icon_variants) and fix one default (DEFAULT_VARIANT).
+--
+-- Layout (pk3DS pk3DS.Core/CTR/Images/BCLIM.cs, GetPixelsViaPalette; Player texture.cpp), pixel data
+-- of a BCLIM whose footer format is 7 and whose data starts with u16 2:
+--   u16 2, u16 colour count, count x u16 colours, then the indices in 8x8 Morton tiles, tile rows
+--   BaseSize/8 tiles wide (BaseSize = next power of two of max(w, h), 64 for 40x30). Indices are
+--   4 bit (two per byte) when the count is at most 16, else 8 bit.
+-- pk3DS reads the colours as RGB565 with low nibble first; its writer (BCLIM.cs) writes RGBA5551,
+-- forces transparent pixels to index 0 and puts the FIRST pixel in the HIGH nibble. Which of these
+-- the game files follow is unconfirmed, hence the four variants A..D below. Nothing is shipped.
+local M = {}
+
+M.FOOTER = 0x28
+M.FMT_OFFSET = 0x20          -- format byte inside the footer
+M.MAX_DIM = 1024
+
+-- Variant table. color: "565" | "5551"; index0: index 0 is transparent (565 has no alpha bit);
+-- high_first: the first (even) pixel of a byte sits in the high nibble.
+M.VARIANTS = {
+  A = { color = "565", index0 = true, high_first = false, desc = "RGB565, index 0 transparent, low nibble first" },
+  B = { color = "5551", index0 = false, high_first = false, desc = "RGBA5551, low nibble first" },
+  C = { color = "565", index0 = true, high_first = true, desc = "RGB565, index 0 transparent, high nibble first" },
+  D = { color = "5551", index0 = false, high_first = true, desc = "RGBA5551, high nibble first" },
+}
+-- E: no palette at all; the data is a plain tiled 16-bit texture (RGBA5551, the footer format 7).
+-- The Player treats every format 7 image whose first u16 is 2 as a palette image, which also
+-- catches a plain texture whose first pixel happens to be 0x0002 (transparent). Plain texture data
+-- is exactly pow2(w) x pow2(h) x 2 bytes (64 x 32 x 2 = 4096 for a 40x30 icon).
+M.VARIANTS.E = { plain = true, color = "5551", desc = "plain tiled RGBA5551, no palette" }
+M.ORDER = { "A", "B", "C", "D", "E" }
+-- The variant icon() uses until the maintainer confirms one (one-line change).
+M.DEFAULT_VARIANT = "A"
+
+local function pow2_at_least_8(v)
+  local p = 8
+  while p < v do p = p << 1 end
+  return p
+end
+
+-- width, height, format byte of the BCLIM footer, or nil.
+local function footer(s)
+  if type(s) ~= "string" or #s < M.FOOTER then return nil end
+  local f = #s - M.FOOTER + 1
+  if s:sub(f, f + 3) ~= "CLIM" or s:sub(f + 0x14, f + 0x17) ~= "imag" then return nil end
+  local w, h = string.unpack("<I2I2", s, f + 0x1C)
+  return w, h, s:byte(f + M.FMT_OFFSET)
+end
+
+-- True for a format 7 BCLIM whose data starts with u16 2 and a nonzero colour count.
+function M.is_palette(s)
+  local w, h, fmt = footer(s)
+  if not w or fmt ~= 7 or #s < M.FOOTER + 4 then return false end
+  local a, count = string.unpack("<I2I2", s, 1)
+  return a == 2 and count >= 1
+end
+
+-- "plain16" when the data size is exactly that of a plain tiled 16-bit texture of the footer size
+-- (format 7 RGBA5551 or 5 RGB565), "palette" when the palette signature holds and the size does not
+-- match a plain texture, else nil.
+function M.layout(s)
+  local w, h, fmt = footer(s)
+  if not w or w < 1 or h < 1 or w > M.MAX_DIM or h > M.MAX_DIM then return nil end
+  if fmt == 7 or fmt == 5 then
+    if #s - M.FOOTER == pow2_at_least_8(w) * pow2_at_least_8(h) * 2 then return "plain16" end
+  end
+  if M.is_palette(s) then return "palette" end
+  return nil
+end
+
+-- Plain facts for diagnostics: { count, pal = { u16... (first 8) }, idx = { bytes... (first 8) },
+-- idx_bytes = bytes left for the indices } or nil when the data is no palette BCLIM.
+function M.inspect(s)
+  if not M.is_palette(s) then return nil end
+  local size = #s - M.FOOTER
+  local count = string.unpack("<I2", s, 3)
+  local out = { count = count, pal = {}, idx = {}, idx_bytes = size - 4 - 2 * count }
+  for i = 1, math.min(8, count) do
+    local o = 4 + (i - 1) * 2 + 1
+    if o + 1 <= size then out.pal[#out.pal + 1] = string.unpack("<I2", s, o) end
+  end
+  local base = 4 + 2 * count
+  for i = 1, 8 do
+    if base + i <= size then out.idx[#out.idx + 1] = s:byte(base + i) end
+  end
+  return out
+end
+
+local function expand(v, bits)
+  if bits == 5 then return (v << 3) | (v >> 2) end
+  return (v << 2) | (v >> 4)
+end
+
+-- Colour u16 -> r, g, b, a (0..255).
+function M.color(v, mode)
+  if mode == "565" then
+    return expand((v >> 11) & 31, 5), expand((v >> 5) & 63, 6), expand(v & 31, 5), 255
+  end
+  return expand((v >> 11) & 31, 5), expand((v >> 6) & 31, 5), expand((v >> 1) & 31, 5), (v & 1) == 1 and 255 or 0
+end
+
+-- Morton position inside an 8x8 tile: MORTON[(y % 8) * 8 + x % 8] = index 0..63
+local MORTON = {}
+for y = 0, 7 do
+  for x = 0, 7 do
+    MORTON[y * 8 + x] = (x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) | ((y & 4) << 3)
+  end
+end
+
+-- Decodes a palette BCLIM. opts: color "565"|"5551" (default "565"), index0 (index 0 transparent,
+-- default true), high_first (default false), bits 4|8 (default: 4 when the count is at most 16),
+-- stride (tile layout width in pixels, multiple of 8; default BaseSize = next power of two of
+-- max(w, h)). Returns { width, height, rgba } or nil, reason.
+function M.decode(s, opts)
+  opts = opts or {}
+  if not M.is_palette(s) then return nil, "not_palette" end
+  local w, h = footer(s)
+  if w < 1 or h < 1 or w > M.MAX_DIM or h > M.MAX_DIM then return nil, "size" end
+  local mode = opts.color or "565"
+  local index0 = opts.index0
+  if index0 == nil then index0 = true end
+  local size = #s - M.FOOTER
+  local count = string.unpack("<I2", s, 3)
+  if 4 + 2 * count > size then return nil, "palette_truncated" end
+  local bits = opts.bits or (count <= 16 and 4 or 8)
+  local stride = opts.stride or pow2_at_least_8(math.max(w, h))
+  if stride % 8 ~= 0 or stride < w then return nil, "stride" end
+  local tiles_x = stride // 8
+  local base = 4 + 2 * count -- 0-based offset of the indices
+  local pal = {}
+  for c = 0, count - 1 do
+    local r, g, b, a = M.color(string.unpack("<I2", s, 5 + c * 2), mode)
+    if index0 and c == 0 then a = 0 end
+    if index0 and c ~= 0 and mode == "565" then a = 255 end
+    pal[c] = string.char(r, g, b, a)
+  end
+  local clear = "\0\0\0\0"
+  local rows = {}
+  for y = 0, h - 1 do
+    local row = {}
+    for x = 0, w - 1 do
+      local n = ((y >> 3) * tiles_x + (x >> 3)) * 64 + MORTON[(y & 7) * 8 + (x & 7)]
+      local idx
+      if bits == 4 then
+        local o = base + (n >> 1) + 1
+        if o > size then return nil, "indices_truncated" end
+        local b = s:byte(o)
+        local first = (n & 1) == 0
+        if opts.high_first then idx = first and (b >> 4) or (b & 15) else idx = first and (b & 15) or (b >> 4) end
+      else
+        local o = base + n + 1
+        if o > size then return nil, "indices_truncated" end
+        idx = s:byte(o)
+      end
+      row[x + 1] = pal[idx] or clear
+    end
+    rows[y + 1] = table.concat(row)
+  end
+  return { width = w, height = h, rgba = table.concat(rows) }
+end
+
+-- Decodes a plain tiled 16-bit texture ("plain16" layout), cropped to the footer size.
+-- opts.color: "5551" (default for format 7) or "565" (default for format 5).
+function M.decode_plain(s, opts)
+  opts = opts or {}
+  local w, h, fmt = footer(s)
+  if M.layout(s) ~= "plain16" then return nil, "not_plain16" end
+  local mode = opts.color or (fmt == 5 and "565" or "5551")
+  local tiles_x = pow2_at_least_8(w) // 8
+  local rows = {}
+  for y = 0, h - 1 do
+    local row = {}
+    for x = 0, w - 1 do
+      local n = ((y >> 3) * tiles_x + (x >> 3)) * 64 + MORTON[(y & 7) * 8 + (x & 7)]
+      local r, g, b, a = M.color(string.unpack("<I2", s, n * 2 + 1), mode)
+      row[x + 1] = string.char(r, g, b, a)
+    end
+    rows[y + 1] = table.concat(row)
+  end
+  return { width = w, height = h, rgba = table.concat(rows) }
+end
+
+-- Decodes `s` as named variant A..E, or nil, reason.
+function M.decode_variant(s, label)
+  local v = M.VARIANTS[label]
+  if not v then return nil, "unknown_variant" end
+  if v.plain then return M.decode_plain(s, { color = v.color }) end
+  return M.decode(s, M.variant_opts(label))
+end
+
+-- Decodes an icon the way icon() does: plain 16-bit layout as a plain texture, palette layout with
+-- the default variant; nil when the data is neither (the caller uses fb.codec.bclim).
+function M.decode_auto(s)
+  local layout = M.layout(s)
+  if layout == "plain16" then return M.decode_plain(s) end
+  if layout == "palette" then return M.decode(s, M.variant_opts(M.DEFAULT_VARIANT)) end
+  return nil, "not_palette"
+end
+
+-- Options of a named variant (A..D), or nil.
+function M.variant_opts(label)
+  local v = M.VARIANTS[label]
+  if not v then return nil end
+  return { color = v.color, index0 = v.index0, high_first = v.high_first }
 end
 
 return M

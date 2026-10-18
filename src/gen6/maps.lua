@@ -2,8 +2,11 @@
 -- runtime (plain files, GARC entries, LZ10/LZ11-wrapped entries, DARC archives)
 -- and converts a chosen one to PNG. No image is shipped; the index and PNGs are
 -- derived data in the plugin cache (fb.cache). Scanning is a resumable state
--- machine: one step = one directory listing, one file read, or a bounded batch
--- of entries, so no entry call nears the 500 ms / 20M instruction budget.
+-- machine. One unit = one directory listing, one archive open, or a bounded batch of entries;
+-- one step() runs units until a wall-clock budget (STEP_BUDGET_MS, fb.clock) is used up, so no
+-- entry call nears the 500 ms / 20M instruction budget. The scan always ends in `done` (a list,
+-- possibly empty) or `failed` (with a reason): a throwing entry or archive is skipped and counted
+-- (never retried), and MAX_SCAN_MS bounds the whole scan.
 local darc = require("gen6.darc")
 local garc_entry = require("gen6.garc_entry")
 
@@ -13,10 +16,18 @@ M.ROOT = "/a"
 M.MAX_FILE_SIZE = 32 * 1024 * 1024  -- larger files are skipped
 M.MIN_FILE_SIZE = 64
 M.MIN_W, M.MIN_H = 256, 128         -- candidate threshold (decoded size = BCLIM header size)
-M.ENTRIES_PER_STEP = 16
+M.ENTRIES_PER_STEP = 16             -- entries per unit
+M.STEP_BUDGET_MS = 25               -- wall-clock budget of one step() (units run until it is used)
+M.MAX_UNITS_PER_STEP = 200          -- hard cap when fb.clock is missing or stands still
+M.MAX_SCAN_MS = 30 * 60 * 1000      -- scan time limit (fb.clock): then `failed` with the partial list
+-- Entries whose decoded size is below this cannot hold a candidate (4-bit texture of MIN_W x MIN_H
+-- plus the footer): they are skipped without decompressing (LZ header) or decoding.
+M.MIN_DECODED = (256 * 128) // 2 + 40
+M.INDEX_REV = "3"                   -- cache format revision; other revisions are rescanned
 M.MAX_ENTRIES_PER_FILE = 5000
 M.MAX_LZ_INPUT = 2 * 1024 * 1024
 M.MAX_LZ_OUTPUT = 4 * 1024 * 1024
+M.MAX_ERRORS = 500                  -- scan errors tolerated before `failed`
 M.MAX_CANDIDATES = 2000             -- kept in the index
 M.LIST_CAP = 40                     -- returned by map_candidates
 M.MAX_PNG = 1024 * 1024             -- interface value limit
@@ -81,13 +92,32 @@ function M.parse_id(id)
   return path, tonumber(entry), sub
 end
 
+-- Short, log-safe text.
+local function short(v) return (tostring(v):gsub("[^%w _%.:#/%-]", "?"):sub(1, 60)) end
+
 function M.new(fb, game_id, revision_fn)
   local self = {}
   local codec = fb.codec
-  local can = fb.rom and fb.rom.romfs and fb.rom.romfs_list and codec and codec.png and codec.bclim
-    and fb.cache and true or false
-  local state = can and "idle" or "unsupported" -- idle | dirs | files | done | unsupported
+  local missing
+  if not (fb.rom and fb.rom.romfs) then missing = "fb.rom.romfs"
+  elseif not fb.rom.romfs_list then missing = "fb.rom.romfs_list"
+  elseif not codec then missing = "fb.codec"
+  elseif not codec.png then missing = "codec.png"
+  elseif not codec.bclim then missing = "codec.bclim"
+  elseif not fb.cache then missing = "fb.cache" end
+  -- idle | dirs | files | done | failed | unsupported
+  local state = missing and "unsupported" or "idle"
   local dirs, files, fidx, cands, cur = {}, {}, 0, {}, nil
+  local first_reject = missing and ("missing_" .. missing) or nil
+  local fail_reason
+  local stat = { entries = 0, errors = 0, steps = 0, started = nil, elapsed = 0, archives_skipped = 0 }
+
+  local function reject(why) if not first_reject then first_reject = short(why) end end
+  local function clock()
+    if type(fb.clock) ~= "function" then return nil end
+    local ok, v = pcall(fb.clock)
+    if ok and type(v) == "number" then return v end
+  end
 
   local function cread(name)
     local ok, v = pcall(fb.cache.read, name)
@@ -96,27 +126,36 @@ function M.new(fb, game_id, revision_fn)
   local function cwrite(name, data) pcall(fb.cache.write, name, data) end
 
   local function save_index(complete)
-    local lines = { complete and "complete" or "partial" }
+    local lines = { (complete and "complete " or "partial ") .. M.INDEX_REV }
     for _, c in ipairs(cands) do lines[#lines + 1] = c.id .. "\t" .. c.w .. "\t" .. c.h end
     cwrite(M.INDEX, table.concat(lines, "\n") .. "\n")
   end
 
   local function load_state()
     local idx = cread(M.INDEX)
+    local usable = false
     if idx then
       local first = true
+      local loaded = {}
       for line in idx:gmatch("[^\n]+") do
         if first then
           first = false
-          if line == "complete" then state = "done" end
+          local kind, rev = line:match("^(%a+) (%w+)$")
+          if rev == M.INDEX_REV and (kind == "complete" or kind == "partial") then
+            usable = true
+            if kind == "complete" then state = "done" end
+          else
+            break -- index of an older revision (or unknown): rescan
+          end
         else
           local id, w, h = line:match("^(.-)\t(%d+)\t(%d+)$")
-          if id then cands[#cands + 1] = { id = id, w = tonumber(w), h = tonumber(h) } end
+          if id then loaded[#loaded + 1] = { id = id, w = tonumber(w), h = tonumber(h) } end
         end
       end
+      if usable then cands = loaded end
       if state == "done" then return end
     end
-    local list = cread(M.FILES)
+    local list = usable and cread(M.FILES)
     if list then
       for line in list:gmatch("[^\n]+") do files[#files + 1] = line end
       fidx = math.min(tonumber(cread(M.PROGRESS) or "0") or 0, #files)
@@ -160,41 +199,65 @@ function M.new(fb, game_id, revision_fn)
     end
   end
 
+  -- Decoded size announced by an LZ10/LZ11 header, or nil.
+  local function lz_size(e)
+    if #e < 8 then return nil end
+    local n = string.unpack("<I3", e, 2)
+    if n == 0 then n = string.unpack("<I4", e, 5) end
+    return n
+  end
+
   local function examine(e, id)
     local b = e:byte(1)
-    if (b == 0x10 or b == 0x11) and #e <= M.MAX_LZ_INPUT and codec.lz_decompress and #e > 4 then
-      local out, status = garc_entry.decompress(codec, e, true)
-      if status == "lz" then examine_plain(out, id) end
+    if (b == 0x10 or b == 0x11) and #e > 4 and codec.lz_decompress then
+      -- the header tells the decoded size: entries that cannot hold a candidate are not decompressed
+      local n = lz_size(e)
+      if #e <= M.MAX_LZ_INPUT and n and n >= M.MIN_DECODED and n <= M.MAX_LZ_OUTPUT then
+        local out, status = garc_entry.decompress(codec, e, true)
+        if status == "lz" then examine_plain(out, id) else reject("lz_failed " .. id) end
+      end
       return
     end
-    examine_plain(e, id)
+    if #e >= M.MIN_DECODED then examine_plain(e, id) end
   end
 
   local function open_file(path)
     local d = fb.rom.romfs(path)
-    if type(d) ~= "string" then return nil end
+    if type(d) ~= "string" then reject("romfs_unreadable " .. path); return nil end
     local okg, g = false, nil
     if codec.garc and codec.garc_file then okg, g = pcall(codec.garc, d) end
     if okg and type(g) == "table" and type(g.count) == "number" and g.count >= 1 then
-      return { path = path, data = d, garc = true, count = math.min(g.count, M.MAX_ENTRIES_PER_FILE), next = 1 }
+      return { path = path, data = d, garc = true, count = math.min(g.count, M.MAX_ENTRIES_PER_FILE), next = 1, g = g }
     end
     return { path = path, data = d, garc = false, count = 1, next = 1 }
   end
 
+  -- One bounded batch of entries; `next` moves first, so a throwing entry is never retried.
   local function process(c)
     local last = math.min(c.next + M.ENTRIES_PER_STEP - 1, c.count)
     for i = c.next, last do
-      local e = c.data
-      if c.garc then e = codec.garc_file(c.data, i, 1) end
-      if type(e) == "string" and #e >= 40 then examine(e, c.path .. "#" .. i) end
+      c.next = i + 1
+      stat.entries = stat.entries + 1
+      local ok, err = pcall(function()
+        local e = c.data
+        if c.garc then
+          local f = c.g.files and c.g.files[i] and c.g.files[i][1]
+          if type(f) == "table" and type(f.length) == "number" and f.length < 40 then return end
+          e = codec.garc_file(c.data, i, 1)
+        end
+        if type(e) == "string" and #e >= 40 then examine(e, c.path .. "#" .. i) end
+      end)
+      if not ok then
+        stat.errors = stat.errors + 1
+        reject("entry_error " .. c.path .. "#" .. i .. ": " .. tostring(err))
+      end
     end
-    c.next = last + 1
     return c.next > c.count
   end
 
   local function scan_dir(dir)
     local list = fb.rom.romfs_list(dir)
-    if type(list) ~= "table" then return end
+    if type(list) ~= "table" then reject("list_failed " .. dir); return end
     for _, e in ipairs(list) do
       local full = dir .. "/" .. tostring(e.name)
       if e.dir then
@@ -217,6 +280,13 @@ function M.new(fb, game_id, revision_fn)
     if fb.log and fb.log.info then fb.log.info("map scan finished, " .. #cands .. " candidates") end
   end
 
+  local function fail(why)
+    state, cur, fail_reason = "failed", nil, short(why)
+    save_index(false)
+    if fb.log and fb.log.error then fb.log.error("map scan failed: " .. tostring(why)) end
+  end
+
+  -- One unit of work.
   local function advance()
     if state == "idle" then load_state() end
     if state == "idle" then return end
@@ -248,8 +318,14 @@ function M.new(fb, game_id, revision_fn)
       elseif fidx >= #files then
         finish()
       else
-        local c = open_file(files[fidx + 1])
-        if c then cur = c else fidx = fidx + 1 end
+        local path = files[fidx + 1]
+        local ok, c = pcall(open_file, path)
+        if not ok then
+          reject("archive_error " .. path .. ": " .. tostring(c))
+          stat.errors = stat.errors + 1
+          c = nil
+        end
+        if c then cur = c else fidx = fidx + 1; stat.archives_skipped = stat.archives_skipped + 1 end
       end
     end
   end
@@ -257,22 +333,68 @@ function M.new(fb, game_id, revision_fn)
   -- Restore the saved index/progress at once (cheap cache reads only).
   if state == "idle" then pcall(load_state) end
 
-  -- One bounded scan step. Never raises.
+  local function terminal() return state == "done" or state == "failed" or state == "unsupported" end
+
+  -- One bounded scan step: units until STEP_BUDGET_MS (fb.clock) is used. Never raises.
   function self.step()
-    if state == "done" or state == "unsupported" then return end
-    local ok, err = pcall(advance)
-    if not ok then
-      state = "unsupported"
-      if fb.log and fb.log.error then fb.log.error("map scan failed: " .. tostring(err)) end
+    if terminal() then return end
+    stat.steps = stat.steps + 1
+    local t0 = clock()
+    if t0 and not stat.started then stat.started = t0 end
+    for _ = 1, M.MAX_UNITS_PER_STEP do
+      local ok, err = pcall(advance)
+      if not ok then
+        -- advance() itself raised outside the per-entry/per-archive guards (directory listing, cache,
+        -- sort): skip the work item that raised, never loop on it
+        stat.errors = stat.errors + 1
+        reject("scan_error: " .. tostring(err))
+        if state == "dirs" then
+          -- the directory was already taken from the queue
+        elseif state == "files" then
+          if cur then cur = nil end
+          fidx = fidx + 1
+          stat.archives_skipped = stat.archives_skipped + 1
+        else
+          fail("scan_error: " .. tostring(err))
+        end
+        if stat.errors > M.MAX_ERRORS then fail("too_many_errors") end
+      end
+      if terminal() then return end
+      local now = clock()
+      if now then
+        stat.elapsed = now - (stat.started or now)
+        if stat.elapsed > M.MAX_SCAN_MS then fail("time_limit"); return end
+        if t0 and now - t0 >= M.STEP_BUDGET_MS then return end
+      end
     end
   end
 
   function self.state() return state end
-  function self.found() return state == "done" and #cands > 0 end
+  function self.found() return (state == "done" or state == "failed") and #cands > 0 end
+
+  function self.diagnostics()
+    return {
+      map_state = state,
+      map_archives_scanned = fidx,
+      map_archives_total = #files,
+      map_archives_skipped = stat.archives_skipped,
+      map_dirs_pending = #dirs,
+      map_entries_scanned = stat.entries,
+      map_errors = stat.errors,
+      map_candidates = #cands,
+      map_current = cur and cur.path or "none",
+      map_first_rejection = first_reject or "none",
+      map_fail_reason = fail_reason or "none",
+      map_steps = stat.steps,
+      map_elapsed_ms = stat.elapsed,
+    }
+  end
 
   function self.candidates()
     if state == "unsupported" then return nil, "unsupported" end
-    if state ~= "done" then self.step(); return nil, "not_ready" end
+    if not terminal() then self.step() end
+    if state == "failed" and #cands == 0 then return nil, "unsupported" end
+    if state ~= "done" and state ~= "failed" then return nil, "not_ready" end
     local out = {}
     for i = 1, math.min(#cands, M.LIST_CAP) do
       local c = cands[i]
@@ -291,7 +413,7 @@ function M.new(fb, game_id, revision_fn)
       if #hit > M.MAX_PNG then return nil, "too_large" end
       return hit
     end
-    if state ~= "done" then self.step(); return nil, "not_ready" end
+    if state ~= "done" and state ~= "failed" then self.step(); return nil, "not_ready" end
     local known = false
     for _, c in ipairs(cands) do if c.id == id then known = true; break end end
     if not known then return nil, "unknown_map" end

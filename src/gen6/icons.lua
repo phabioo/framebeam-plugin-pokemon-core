@@ -7,6 +7,7 @@
 -- Discovery runs one small step per call (one directory listing or one
 -- candidate validation) so no entry call comes near the 500 ms / 20M budget.
 local garc_entry = require("gen6.garc_entry")
+local pal_bclim = require("gen6.pal_bclim")
 local M = {}
 
 M.CANDIDATE_PATHS = {}      -- known paths are not sourced; discovery finds the file
@@ -20,6 +21,7 @@ M.MAX_STEPS = 4000
 M.INDEX_FILE = "icons/index.txt"      -- first line: RomFS path of the icon GARC
 M.OVERRIDE_FILE = "config/icon_garc.txt" -- optional: RomFS path to try first
 M.MAX_SPECIES = 721
+M.CACHE_REV = "r2"  -- part of the PNG cache key: bump when the decoding changes (v0.3.3 cached wrong PNGs)
 M.PROBE_PATH = "/a/0/9/1"   -- Project Pokemon ORAS file system: "971 box sprites" (diagnostics probe only)
 M.PROBE_ENTRIES = { 1, 25, 700 } -- 0-based GARC entries inspected by diagnostics()
 
@@ -147,6 +149,20 @@ function M.new(fb, personal)
     end
     out[tag .. "_fmt"], out[tag .. "_w"], out[tag .. "_h"] = fmt, w, h
     out[tag .. "_px0"] = #e >= 2 and string.format("0x%04X", string.unpack("<I2", e, 1)) or "none"
+    out[tag .. "_layout"] = pal_bclim.layout(e) or "none"
+    local info = pal_bclim.inspect(e)
+    if info then
+      local pal, idx = {}, {}
+      for _, v in ipairs(info.pal) do pal[#pal + 1] = string.format("%04X", v) end
+      for _, v in ipairs(info.idx) do idx[#idx + 1] = string.format("%02X", v) end
+      out[tag .. "_count"] = info.count
+      out[tag .. "_pal"] = table.concat(pal, ",")
+      out[tag .. "_idx"] = table.concat(idx, ",")
+      out[tag .. "_idxbytes"] = info.idx_bytes
+    end
+    local head = {}
+    for i = 1, math.min(16, #e) do head[i] = string.format("%02X", e:byte(i)) end
+    out[tag .. "_head"] = table.concat(head, " ")
   end
 
   local function run_probe()
@@ -200,17 +216,9 @@ function M.new(fb, personal)
     return species, false
   end
 
-  -- PNG string, or nil, "not_ready" | "unsupported" | "unknown_species".
-  function self.icon(species, form)
-    if math.type(species) ~= "integer" or species < 1 or species > M.MAX_SPECIES then
-      return nil, "unknown_species"
-    end
-    if form == nil then form = 0 end
-    if math.type(form) ~= "integer" or form < 0 then return nil, "unknown_species" end
-    local key = string.format("icons/%d-%d.png", species, form)
+  -- Blob of a species form, or nil, reason.
+  local function blob_for(species, form)
     if state == "unsupported" then return nil, "unsupported" end
-    local hit = read_cache(key)
-    if hit then return hit end
     if state ~= "done" then
       self.step()
       if state == "failed" then return nil, "unsupported" end
@@ -219,12 +227,61 @@ function M.new(fb, personal)
     local idx, exact = entry_for(species, form)
     local blob = garc_entry.entry(codec, data, idx + 1)
     if type(blob) ~= "string" then return nil, "unknown_species" end
-    local img = codec.bclim(blob)
+    return blob, exact
+  end
+
+  local function valid_args(species, form)
+    if math.type(species) ~= "integer" or species < 1 or species > M.MAX_SPECIES then return false end
+    if form == nil then form = 0 end
+    if math.type(form) ~= "integer" or form < 0 then return false end
+    return true, form
+  end
+
+  -- PNG string, or nil, "not_ready" | "unsupported" | "unknown_species".
+  -- Palette / plain 16-bit data of the Gen 6 icons is decoded in Lua (gen6.pal_bclim, default
+  -- variant pal_bclim.DEFAULT_VARIANT); every other BCLIM goes through fb.codec.bclim.
+  function self.icon(species, form)
+    local ok, f = valid_args(species, form)
+    if not ok then return nil, "unknown_species" end
+    form = f
+    local key = string.format("icons/%d-%d-%s.png", species, form, M.CACHE_REV)
+    if state == "unsupported" then return nil, "unsupported" end
+    local hit = read_cache(key)
+    if hit then return hit end
+    local blob, exact = blob_for(species, form)
+    if not blob then return nil, exact end
+    local img = pal_bclim.decode_auto(blob)
+    if type(img) ~= "table" then img = codec.bclim(blob) end
     if type(img) ~= "table" then return nil, "unknown_species" end
     local png = codec.png(img)
     if type(png) ~= "string" then return nil, "unknown_species" end
     if exact then pcall(fb.cache.write, key, png) end
     return png
+  end
+
+  -- Up to 5 decodings of the species icon to compare: { label, desc, png } for the labels A..D
+  -- (palette readings, see pal_bclim.VARIANTS) and E (plain tiled RGBA5551). Variants that cannot
+  -- be decoded for this data are left out. nil, "not_ready" | "unsupported" | "unknown_species".
+  function self.icon_variants(species, form)
+    local ok, f = valid_args(species, form)
+    if not ok then return nil, "unknown_species" end
+    local blob, err = blob_for(species, f)
+    if not blob then return nil, err end
+    local layout = pal_bclim.layout(blob)
+    if layout == nil then return nil, "unsupported" end
+    -- consumers may show only the first 4 entries: for plain 16-bit data E (the likely reading) goes first
+    local order = pal_bclim.ORDER
+    if layout == "plain16" then order = { "E", "A", "B", "C", "D" } end
+    local out = {}
+    for _, label in ipairs(order) do
+      local img = pal_bclim.decode_variant(blob, label)
+      local png = type(img) == "table" and codec.png(img)
+      if type(png) == "string" then
+        out[#out + 1] = { label = label, desc = pal_bclim.VARIANTS[label].desc, png = png }
+      end
+    end
+    if #out == 0 then return nil, "unsupported" end
+    return out
   end
 
   return self
