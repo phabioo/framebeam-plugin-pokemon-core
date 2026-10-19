@@ -1,7 +1,7 @@
 {
   "id": "net.framebeam.pokemon-core",
-  "name": "Pokémon Core",
-  "version": "0.3.4",
+  "name": "SoulLink Core",
+  "version": "0.3.5",
   "api": 1,
   "type": "script",
   "provides": ["pokemon.core"],

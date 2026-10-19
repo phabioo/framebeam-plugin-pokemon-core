@@ -1,4 +1,4 @@
--- Entry module of the Pokemon Core plugin.
+-- Entry module of the SoulLink Core plugin.
 local games = require("core.games")
 local adapters = require("core.adapters")
 local interface = require("core.interface")
