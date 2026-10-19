@@ -1,4 +1,4 @@
-# FrameBeam Plugin: Pokémon Core
+# FrameBeam Plugin: SoulLink Core
 
 Shared Pokémon foundation: game detection, memory adapters and asset extraction for other FrameBeam plugins.
 
