@@ -9,6 +9,7 @@ on:
         required: true
 permissions:
   contents: write
+  pull-requests: read
 jobs:
   release:
     name: package and release
@@ -40,6 +41,7 @@ jobs:
           fi
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           ref: ${{ steps.tag.outputs.exists == 'true' && format('refs/tags/{0}', env.TAG) || github.sha }}
       - run: sudo apt-get update && sudo apt-get install -y lua5.4
       - run: lua5.4 tools/bundle.lua --check
@@ -48,16 +50,33 @@ jobs:
         run: python3 -I tools/package.py --out dist --tag "$TAG"
       - name: Verify package
         run: python3 -I tools/package.py --verify dist/*.fbplugin
+      - name: Build release notes from PR changelogs
+        run: |
+          base=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -vxF "$TAG" | { cat; echo "$TAG"; } | sort -V | grep -xF -B1 "$TAG" | head -n1)
+          if [ -z "$base" ] || [ "$base" = "$TAG" ]; then
+            base=$(git rev-list --max-parents=0 HEAD | tail -n1)
+          fi
+          if ! python3 -I tools/changelog.py collect --repo "$GITHUB_REPOSITORY" --base "$base" --head HEAD \
+            --format markdown --title "## Changes since ${base#v}" --compare-url > notes.md; then
+            echo "::warning::Changelog collection failed; falling back to generated notes"
+            rm -f notes.md
+          fi
       - name: Create or update release
         env:
           TAG_EXISTS: ${{ steps.tag.outputs.exists }}
         run: |
           asset=$(ls dist/*.fbplugin)
+          if [ -s notes.md ]; then
+            notes=(--notes-file notes.md)
+          else
+            notes=(--generate-notes)
+          fi
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "$asset" --clobber
+            if [ -s notes.md ]; then gh release edit "$TAG" --notes-file notes.md; fi
           elif [ "$TAG_EXISTS" = "true" ]; then
-            gh release create "$TAG" "$asset" --title "$TAG" --verify-tag --generate-notes
+            gh release create "$TAG" "$asset" --title "$TAG" --verify-tag "${notes[@]}"
           else
             # Creates the tag at the checked-out commit.
-            gh release create "$TAG" "$asset" --title "$TAG" --target "$GITHUB_SHA" --generate-notes
+            gh release create "$TAG" "$asset" --title "$TAG" --target "$GITHUB_SHA" "${notes[@]}"
           fi
