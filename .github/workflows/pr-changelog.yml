@@ -1,0 +1,49 @@
+name: Changelog
+
+# Every PR description carries a `## Changelog` section (format: .github/pull_request_template.md, checker:
+# tools/changelog.py). Bot PRs are exempt. workflow_dispatch (input pr) re-checks a PR whose events did not start workflows.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'Pull request number to check'
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pr-changelog-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  changelog:
+    name: Changelog section
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check the Changelog section
+        env:
+          # User text only ever travels through env, never through ${{ }} inside run.
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_NUMBER: ${{ inputs.pr }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -n "$PR_NUMBER" ]; then
+            PR_BODY="$(gh api "repos/$GH_REPO/pulls/$PR_NUMBER" --jq '.body // ""')"
+            PR_AUTHOR="$(gh api "repos/$GH_REPO/pulls/$PR_NUMBER" --jq '.user.login')"
+            export PR_BODY
+          fi
+          python3 -I tools/changelog.py check --author "$PR_AUTHOR"

@@ -60,6 +60,7 @@ Do not return full logs or file contents. Do not commit.
 ## Packages and PRs
 
 - One PR per package with green CI, one topic per PR.
+- Every PR description has a `## Changelog` section (template in `.github/pull_request_template.md`, `none` for CI/docs/test-only PRs); CI checks it and the release notes are built from it.
 - Milestone PRs update `docs/roadmap.md` (status) and the status line in `README.md`; READMEs stay short, detail goes to `docs/`.
 - Auto-merge is enabled on all PRs once the repository has "Allow auto-merge" and required checks configured.
 
