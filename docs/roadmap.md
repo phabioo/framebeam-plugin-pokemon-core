@@ -1,6 +1,6 @@
 # Roadmap
 
-Status: in progress: skeleton and ORAS adapter; v0.3.5 (v0.3.4 plus the display name "SoulLink Core"; v0.3.4 = v0.3.3 plus the time-budgeted map scan and the Lua icon decoder; v0.3.3 = v0.3.2 plus the Spanish language byte, LZ11 GARC entries, icon/text/personal diagnostics; v0.3.2 = v0.3.1 plus places that never stay empty: text fallback for `locations()`, names before lists, retried scans, `diagnostics()`; v0.3.1: fixes for zones and species names, and `locations()`) delivers live team stats, trainer/badges/money, location with names, encounter areas, battle state, wild encounters and names from the game text for Omega Ruby / Alpha Sapphire (v1.0 and v1.4); real-game verification of the derived and battle addresses is open (`docs/games/omega-ruby-alpha-sapphire.md`). Depends on FrameBeam plugin API v1 (0.11, planned); see https://github.com/phabioo/framebeam `docs/roadmap.md`.
+Status: in progress: skeleton and ORAS adapter; v0.4.0 (new plugin id `uzume.soullink-core`; v0.3.5 = v0.3.4 plus the display name "SoulLink Core"; v0.3.4 = v0.3.3 plus the time-budgeted map scan and the Lua icon decoder; v0.3.3 = v0.3.2 plus the Spanish language byte, LZ11 GARC entries, icon/text/personal diagnostics; v0.3.2 = v0.3.1 plus places that never stay empty: text fallback for `locations()`, names before lists, retried scans, `diagnostics()`; v0.3.1: fixes for zones and species names, and `locations()`) delivers live team stats, trainer/badges/money, location with names, encounter areas, battle state, wild encounters and names from the game text for Omega Ruby / Alpha Sapphire (v1.0 and v1.4); real-game verification of the derived and battle addresses is open (`docs/games/omega-ruby-alpha-sapphire.md`). Depends on FrameBeam plugin API v1 (0.11, planned); see https://github.com/phabioo/framebeam `docs/roadmap.md`.
 
 ## v0.1 Omega Ruby / Alpha Sapphire (3DS, Gen 6)
 
@@ -10,9 +10,10 @@ Status: in progress: skeleton and ORAS adapter; v0.3.5 (v0.3.4 plus the display 
 - Location/route table keyed by internal IDs, with self-recorded map coordinates; `provides` interface for other plugins.
 - Offsets documented per game in `docs/games/<game>.md`; verified locally by the maintainer with the FrameBeam developer mode.
 
-### Status v0.3.5 (ORAS)
+### Status v0.4.0 (ORAS)
 
-- v0.3.5: display name is now "SoulLink Core" (trademark avoidance) (manifest, i18n en/de, README); plugin id `net.framebeam.pokemon-core` and interface `pokemon.core` unchanged.
+- v0.3.5: display name is now "SoulLink Core" (trademark avoidance) (manifest, i18n en/de, README); plugin id and interface unchanged (the id changed in 0.4.0).
+- v0.4.0: new plugin id `uzume.soullink-core` (Uzume ADR 0030 D7); no migration and no compatibility alias; the `provides` interface `pokemon.core` is unchanged.
 
 - v0.3.4 (field report on a real Omega Ruby EUR v1.0, Player 0.15.7): (1) map scan: `step()` now runs units until a 25 ms `fb.clock` budget is used (was one unit per call, i.e. one 16-entry batch per 8 ticks), tiny entries are skipped without decompressing (LZ header size / GARC length), a throwing entry or archive is counted and skipped instead of ending the scan, the scan ends in `done` or `failed` (time limit 30 min, error limit) and `diagnostics()` has `map_*` keys; (2) icons: new `gen6.pal_bclim` (palette variants A-D, plain 16-bit texture E), `icon_variants(species, form)`, PNG cache key with decoder revision, `icon_e1_*` palette/layout diagnostics; format 7 data of exactly 64x32x2 bytes is a plain tiled RGBA5551 texture (a first pixel of 0x0002 matched the Player's palette signature); (3) the personal table is loaded by ticks (it was only loaded on demand, so `personal_attempts=0` was expected when the team carries live levels). Open: which icon variant matches the game (one constant, `pal_bclim.DEFAULT_VARIANT`), where the region map lives (no source), real-game confirmation.
 
