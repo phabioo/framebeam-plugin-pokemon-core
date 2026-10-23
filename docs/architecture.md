@@ -9,7 +9,7 @@
 
 ## Bundling
 
-The FrameBeam sandbox has no `require`, `load`, `dofile`, `io` or `os` and loads one entry file. The bundler wraps each listed module as `__mod["core.games"] = function(...) ... end`, defines a local `require` (loads each module once, returns `nil` for unknown names) and calls `require("main")`. Output is deterministic. `lua5.4 tools/bundle.lua` writes, `--check` exits 1 when `plugin/main.lua` is stale (CI). A new module must be added to `src/modules.txt`; a listed module whose file is missing is skipped.
+The Uzume sandbox has no `require`, `load`, `dofile`, `io` or `os` and loads one entry file. The bundler wraps each listed module as `__mod["core.games"] = function(...) ... end`, defines a local `require` (loads each module once, returns `nil` for unknown names) and calls `require("main")`. Output is deterministic. `lua5.4 tools/bundle.lua` writes, `--check` exits 1 when `plugin/main.lua` is stale (CI). A new module must be added to `src/modules.txt`; a listed module whose file is missing is skipped.
 
 ## Detection
 
@@ -70,6 +70,6 @@ State tracking in `tick()` (`gen6.oras`): revision detection (every 5th tick unt
 
 ## Open
 
-- Gen 1/2: game identification on GB/GBC is open in FrameBeam; no entries yet.
+- Gen 1/2: game identification on GB/GBC is open in Uzume; no entries yet.
 - Format of `fb.game.code` for 3DS (assumed: 16 hex digits title ID) and the system names `3ds`/`nds`/`gba` are not specified in the plugin API doc.
 - Unverified addresses and assumptions of the ORAS adapter: `docs/games/omega-ruby-alpha-sapphire.md`, section Open points.

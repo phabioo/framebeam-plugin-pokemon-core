@@ -1,8 +1,8 @@
-# framebeam-plugin-pokemon-core Individual Contributor License Agreement
+# uzume-plugin-soullink-core Individual Contributor License Agreement
 
 Version 1.0, 2026-10-08
 
-Thank you for contributing to framebeam-plugin-pokemon-core. This agreement is between you ("Contributor") and Fabio, the project owner, together with any successors in that role ("Owner"). It applies to every contribution you submit to the framebeam-plugin-pokemon-core repository ("Contribution"): code, documentation or other material, in any form. It is modeled on the Apache Individual Contributor License Agreement. It is not legal advice.
+Thank you for contributing to uzume-plugin-soullink-core. This agreement is between you ("Contributor") and Fabio, the project owner, together with any successors in that role ("Owner"). It applies to every contribution you submit to the uzume-plugin-soullink-core repository ("Contribution"): code, documentation or other material, in any form. It is modeled on the Apache Individual Contributor License Agreement. It is not legal advice.
 
 1. **You keep your copyright.** You remain the owner of your Contributions. This agreement only grants the licenses below.
 2. **Copyright license.** You grant the Owner a perpetual, worldwide, non-exclusive, royalty-free, irrevocable license to use, reproduce, modify, prepare derivative works of, publicly display, publicly perform, sublicense and distribute your Contributions and derivative works, in source or binary form. This explicitly includes the right to sublicense and to distribute Contributions under licenses other than the GPL, including proprietary or commercial terms.
