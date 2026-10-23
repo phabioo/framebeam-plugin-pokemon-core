@@ -205,3 +205,48 @@ t.case("v0.3.3: diagnostics() names where icon reading stops", function()
   local b = make({ romfs = { ["/a/0/9/2"] = icon_garc(5, 40, 30) } })
   t.eq(b:diagnostics().icons_path, "/a/0/9/1 (unreadable)")
 end)
+
+-- v0.4.1: one-time debug export of raw icon entries into the plugin cache (fb.cache), synthetic data only
+t.case("v0.4.1: debug export writes diag files once discovery is done", function()
+  local a, mock = make({ romfs = { ["/a/0/9/1"] = lz_icon_garc(800, 40, 30) } })
+  t.eq(a:diagnostics().icon_export, "pending")
+  t.ok(run_until(a, function() return (a:diagnostics().icon_export or ""):match("^done") ~= nil end), "export done")
+  local c = mock.cache_files
+  for _, n in ipairs({ 0, 1, 25, 201, 255, 258, 261 }) do
+    local f = c["diag/icon-" .. n .. ".bin"]
+    t.ok(f and #f == 40 + 40 * 30 * 4 or false, "entry " .. n)
+    t.eq(f:byte(1), n % 256)
+  end
+  t.eq(c["diag/icon-1-raw.bin"]:byte(1), 0x11)
+  t.eq(c["diag/icon-255-raw.bin"]:byte(1), 0x11)
+  t.eq(c["diag/icon-25-raw.bin"], nil)
+  local idx = c["diag/icon-index.txt"]
+  t.ok(idx:match("^# garc=/a/0/9/1 entries=800 version=n/a data_offset=%d+ fatb_subfiles_first8=1,1,1,1,1,1,1,1\n"), idx)
+  t.ok(idx:match("\n25 comp=%d+ decomp=4840 head=19 00 00 FF .- footer=w=40 h=30 fmt=9\n"), idx)
+  t.eq(a:diagnostics().icon_export, "done:10 files")
+  local before = 0
+  for _ in pairs(c) do before = before + 1 end
+  c["diag/icon-25.bin"] = nil
+  for _ = 1, 200 do a:tick() end
+  t.eq(c["diag/icon-25.bin"], nil) -- once per session
+end)
+
+t.case("v0.4.1: debug export caps files and adds team species", function()
+  local a, mock = make({ romfs = { ["/a/0/9/1"] = icon_garc(800, 40, 30) } })
+  local ex = require("gen6.icons")
+  t.eq(ex.EXPORT_MAX_BINS, 12)
+  t.ok(run_until(a, function() return (a:diagnostics().icon_export or ""):match("^done") ~= nil end), "done")
+  local n = 0
+  for k in pairs(mock.cache_files) do if k:match("^diag/icon%-[%d%-raw]+%.bin$") then n = n + 1 end end
+  t.ok(n <= 12 and n >= 9, "bins " .. n)
+end)
+
+t.case("v0.4.1: debug export never throws and reports the reason", function()
+  local a, mock = make({ romfs = { ["/a/0/9/1"] = icon_garc(800, 40, 30) } })
+  mock.fb.cache.write = function(name) if name:match("^diag/") then error("disk full") end return true end
+  t.ok(run_until(a, function() return (a:diagnostics().icon_export or "") ~= "pending" end), "reported")
+  t.eq(a:diagnostics().icon_export, "write_failed")
+  local b = make({ romfs = { ["/a/0/0/1"] = string.rep("x", 1000) } })
+  t.ok(run_until(b, function() return b:diagnostics().icon_export ~= "pending" end), "no archive")
+  t.eq(b:diagnostics().icon_export, "no_icon_archive")
+end)
