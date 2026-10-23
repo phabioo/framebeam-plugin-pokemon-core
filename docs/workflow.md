@@ -1,21 +1,21 @@
 # Working with Claude Code
 
-Adapted from the FrameBeam workflow (https://github.com/phabioo/framebeam, `docs/workflow.md`).
+Adapted from the Uzume workflow (https://github.com/phabioo/uzume, `docs/workflow.md`).
 
 ## Hybrid mode
 
 - Development happens in Claude Code cloud sessions.
-- Real games are tested only locally by Fabio, using the FrameBeam developer mode (live values, events, log). Recorded game data stays local.
+- Real games are tested only locally by Fabio, using the Uzume developer mode (live values, events, log). Recorded game data stays local.
 
 ## What can be verified in the cloud
 
 Verifiable:
-- Lua code with lua5.4 against synthetic data generated from documented formats (and the FrameBeam test core once the API exists).
+- Lua code with lua5.4 against synthetic data generated from documented formats (and the Uzume test core once the API exists).
 - Manifest and i18n checks, docs link checks, CI.
 
 Not verifiable (only locally by Fabio):
 - Behavior with real games: memory map coverage, offsets, encounters, languages.
-- UI look and feel inside the Player, controller operation, performance.
+- UI look and feel inside the app, controller operation, performance.
 - Real ROMs/BIOS/game dumps must not enter the repository or the cloud.
 
 ## Roles
@@ -38,7 +38,7 @@ Agents use the model aliases so they follow new releases. Haiku is for search, e
 
 ```text
 Goal: <one sentence>
-Context: <doc or FrameBeam architecture section; optionally a short quote>
+Context: <doc or Uzume architecture section; optionally a short quote>
 Files/paths: create/modify: <...>; touch nothing else
 Acceptance criteria:
 - <...>

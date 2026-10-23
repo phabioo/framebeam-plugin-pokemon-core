@@ -2,13 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-framebeam-plugin-pokemon-core is the shared Pokémon foundation plugin. It detects the game (3DS title ID, later NDS/GBA/GB game codes), decodes the data structures in emulator memory (team, boxes, location, battle, encounters, badges; for Gen 6 including PKM decryption and shuffle), extracts assets from the player's own game files at runtime, and `provides` a generic Pokémon interface to other plugins (SoulLink, editor, cheats). It contains per-game adapters and no gameplay rules.
+uzume-plugin-soullink-core is the shared Pokémon foundation plugin. It detects the game (3DS title ID, later NDS/GBA/GB game codes), decodes the data structures in emulator memory (team, boxes, location, battle, encounters, badges; for Gen 6 including PKM decryption and shuffle), extracts assets from the player's own game files at runtime, and `provides` a generic Pokémon interface to other plugins (SoulLink, editor, cheats). It contains per-game adapters and no gameplay rules.
 
-## Relation to FrameBeam
+## Relation to Uzume
 
-- Plugin for [FrameBeam](https://github.com/phabioo/framebeam) (self-hosted retro gaming platform). Interface: `docs/architecture/12-plugins.md` in the FrameBeam repository.
-- Plugin API v1 is planned (FrameBeam 0.11) and not implemented yet; everything here is design until it exists. Open API items are marked open, never invented.
-- Runtime: Lua 5.4 in the FrameBeam sandbox; UI only as declarative building blocks (no QML).
+- Plugin for [Uzume](https://github.com/phabioo/uzume) (self-hosted retro gaming platform). Interface: `docs/architecture/12-plugins.md` and `docs/guides/plugin-api.md` in the Uzume repository.
+- Plugin API v1 ships with Uzume since 0.11 (`docs/guides/plugin-api.md` there). Open API items are marked open, never invented.
+- Runtime: Lua 5.4 in the Uzume sandbox; UI only as declarative building blocks (no QML).
 
 ## Working rules
 
@@ -36,10 +36,10 @@ framebeam-plugin-pokemon-core is the shared Pokémon foundation plugin. It detec
 - Sources are modules in `src/`; the sandbox has no `require`, so `lua5.4 tools/bundle.lua` generates the single `plugin/main.lua` (committed; list new modules in `src/modules.txt`). `lua5.4 tools/bundle.lua --check` fails when it is stale.
 - Tests: `lua5.4 tests/run.lua` (fake `fb` in `tests/support/fb_mock.lua`, synthetic PK6 via `tests/support/pk6_*.lua`). CI runs both checks (`.github/workflows/ci.yml`).
 - Packaging: `python3 -I tools/package.py [--out DIR] [--tag vX.Y.Z]` builds the unsigned `<id>-<version>.fbplugin` from `plugin/` (deterministic; `--tag` must equal the manifest version; `--verify FILE` validates structure). Release: `.github/workflows/release.yml` on `v*` tags (README, Releasing); CI also builds the package.
-- The folder `plugin/` is what gets installed or linked in the FrameBeam developer mode.
+- The folder `plugin/` is what gets installed or linked in the Uzume developer mode.
 - The SessionStart hook `.claude/hooks/session-start.sh` only prepares cloud sessions (installs `lua5.4` via apt if missing).
 
 ## Pointers
 
 - Plan and status: `docs/roadmap.md`. Workflow, roles and brief template: `docs/workflow.md`. Per-game adapter docs: `docs/games/<game>.md`.
-- FrameBeam docs: https://github.com/phabioo/framebeam (`docs/architecture/12-plugins.md`, `docs/adr/0023-plugins.md`).
+- Uzume docs: https://github.com/phabioo/uzume (`docs/architecture/12-plugins.md`, `docs/adr/0023-plugins.md`).

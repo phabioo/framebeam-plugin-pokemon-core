@@ -6,7 +6,7 @@ Usage (from repo root):
   python3 tools/package.py --verify FILE                validate an existing package
 
 Deterministic: sorted entries, fixed timestamps and permissions, no extra fields.
-Limits follow FrameBeam docs/architecture/12-plugins.md.
+Limits follow Uzume docs/architecture/12-plugins.md.
 """
 import argparse
 import json

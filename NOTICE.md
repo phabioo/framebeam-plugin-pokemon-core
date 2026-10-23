@@ -1,8 +1,8 @@
 # Notice
 
-framebeam-plugin-pokemon-core (plugin for FrameBeam)
+uzume-plugin-soullink-core (plugin for Uzume)
 
-Copyright (C) 2026 Fabio and framebeam-plugin-pokemon-core contributors
+Copyright (C) 2026 Fabio and uzume-plugin-soullink-core contributors
 
 SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -16,7 +16,7 @@ Contributions are accepted under the [CLA](CLA.md).
 
 ## Trademarks
 
-The name "FrameBeam" and the FrameBeam logo are reserved by the FrameBeam project owner. The GPL covers the code only; it does not grant any right to use the name or the logo. Forks and modified versions must use a different name and must not use the logo.
+The name "Uzume" and the Uzume logo are reserved by the project owner. The GPL covers the code only; it does not grant any right to use the name or the logo. Forks and modified versions must use a different name and must not use the logo.
 
 Pokémon and Nintendo are trademarks of their respective owners. This project is not affiliated with, endorsed or sponsored by Nintendo, The Pokémon Company, Game Freak or any other rights holder; game and system names are used only to describe compatibility.
 

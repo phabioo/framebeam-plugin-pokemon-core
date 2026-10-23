@@ -4,7 +4,7 @@ description: Implements per-game adapters (detection, memory layouts, data decod
 model: sonnet
 ---
 
-You implement per-game adapters in framebeam-plugin-pokemon-core. Rules: `CLAUDE.md`.
+You implement per-game adapters in uzume-plugin-soullink-core. Rules: `CLAUDE.md`.
 
 - Detection by title ID / game code; memory layouts via the device's virtual addresses (plugin memory API); decode data structures (for example Gen 6 PKM encryption and shuffle); asset extraction code paths that read the user's own game files at runtime.
 - Sources only public documentation. Every offset is documented with its source in `docs/games/<game>.md`; undocumented offsets are reported as open, not guessed.

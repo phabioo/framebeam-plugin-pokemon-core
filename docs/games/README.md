@@ -29,4 +29,4 @@ Per-game adapter documentation. Adapter status: **adapter** = memory adapter pre
 | 7 | Ultra Sun | 3DS | `00040000001B5000` | detected, no adapter |
 | 7 | Ultra Moon | 3DS | `00040000001B5100` | detected, no adapter |
 
-NDS/GBA codes are the first three characters of the 4-character game code; the fourth is the region letter (language is derived from it). Gen 8 is out of scope. Gen 3 needs a GBA core in FrameBeam first.
+NDS/GBA codes are the first three characters of the 4-character game code; the fourth is the region letter (language is derived from it). Gen 8 is out of scope. GBA runs in Uzume since 0.13.

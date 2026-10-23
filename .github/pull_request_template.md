@@ -20,5 +20,5 @@ Release notes are collected from this section; CI checks it.
 
 ## Checklist
 
-- [ ] I have read [CLA.md](https://github.com/phabioo/framebeam-plugin-pokemon-core/blob/main/CLA.md) and agree to its terms
+- [ ] I have read [CLA.md](https://github.com/phabioo/uzume-plugin-soullink-core/blob/main/CLA.md) and agree to its terms
 - [ ] No ROMs, BIOS, firmware, keys, or extracted game assets/RAM dumps are added
