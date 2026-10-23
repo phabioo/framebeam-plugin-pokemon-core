@@ -396,6 +396,10 @@ M.MAX_STEPS = 4000
 M.INDEX_FILE = "icons/index.txt"      -- first line: RomFS path of the icon GARC
 M.OVERRIDE_FILE = "config/icon_garc.txt" -- optional: RomFS path to try first
 M.MAX_SPECIES = 721
+M.EXPORT_ENTRIES = { 0, 1, 25, 201, 255, 258, 261 } -- 0-based GARC entries of the one-time debug export
+M.EXPORT_RAW = { 1, 255 }        -- entries that are also exported undecompressed
+M.EXPORT_MAX_BINS = 12           -- cap of exported .bin files
+M.EXPORT_BUDGET_MS = 25          -- wall-clock budget of one export step (fb.clock)
 M.CACHE_REV = "r2"  -- part of the PNG cache key: bump when the decoding changes (v0.3.3 cached wrong PNGs)
 M.PROBE_PATH = "/a/0/9/1"   -- Project Pokemon ORAS file system: "971 box sprites" (diagnostics probe only)
 M.PROBE_ENTRIES = { 1, 25, 700 } -- 0-based GARC entries inspected by diagnostics()
@@ -416,6 +420,7 @@ function M.new(fb, personal)
   local state = can and "idle" or "unsupported" -- idle | scan | done | failed | unsupported
   local data, path
   local forced, dirs, cands, steps = {}, {}, {}, 0
+  local exp_status = "pending" -- diagnostics key icon_export
 
   local function read_cache(name)
     local ok, v = pcall(fb.cache.read, name)
@@ -562,7 +567,7 @@ function M.new(fb, personal)
   end
 
   function self.diagnostics()
-    if not can then return { icons_state = state } end
+    if not can then return { icons_state = state, icon_export = "unsupported" } end
     -- one probe per archive: the fixed probe path until discovery accepts another archive
     local key = path or M.PROBE_PATH
     if not probe or probe_key ~= key then probe, probe_key = run_probe(), key end
@@ -570,8 +575,116 @@ function M.new(fb, personal)
     for k, v in pairs(probe) do out[k] = v end
     out.icons_state = state
     out.icons_first_rejection = first_reject or "none"
+    out.icon_export = exp_status
     return out
   end
+
+  -- One-time debug export (0.4.1): the DECOMPRESSED bytes of a few icon GARC entries (exactly what
+  -- the decoder gets) go to the plugin's own cache as diag/icon-<entry0>.bin, plus diag/icon-index.txt.
+  -- Local to the player's PC, never logged. Runs one time-budgeted step per call once discovery is done.
+  local exp = { state = "idle", queue = nil, lines = {}, files = 0, bins = 0, g = nil, err = nil }
+  local function exp_clock() local ok, v = pcall(fb.clock or function() end); return ok and v or nil end
+
+  local function exp_fail(why)
+    exp.state = "failed"
+    exp_status = short(why)
+  end
+
+  local function exp_write(name, bytes)
+    local ok, r = pcall(fb.cache.write, name, bytes)
+    if not ok or r == false then return false end
+    exp.files = exp.files + 1
+    return true
+  end
+
+  local function exp_queue(team_fn)
+    local q, seen = {}, {}
+    local function add(n)
+      if math.type(n) == "integer" and n >= 0 and not seen[n] and #q < M.EXPORT_MAX_BINS then
+        seen[n] = true; q[#q + 1] = n
+      end
+    end
+    for _, n in ipairs(M.EXPORT_ENTRIES) do add(n) end
+    if type(team_fn) == "function" then
+      local ok, list = pcall(team_fn)
+      if ok and type(list) == "table" then
+        for _, sp in ipairs(list) do if math.type(sp) == "integer" and sp >= 1 then add(sp) end end
+      end
+    end
+    -- raw (undecompressed) copies count against the cap too: they are extra .bin files
+    return q
+  end
+
+  local function exp_header(count, g)
+    local subs = {}
+    for i = 1, 8 do
+      local f = type(g.files) == "table" and g.files[i]
+      subs[i] = type(f) == "table" and tostring(#f) or "n/a"
+    end
+    return string.format("# garc=%s entries=%s version=%s data_offset=%s fatb_subfiles_first8=%s",
+      tostring(path), tostring(count), tostring(g.version or "n/a"), tostring(g.data_offset or "n/a"),
+      table.concat(subs, ","))
+  end
+
+  local function exp_one(n)
+    local ok, raw = pcall(codec.garc_file, data, n + 1, 1)
+    if not ok or type(raw) ~= "string" or #raw == 0 then
+      exp.lines[#exp.lines + 1] = string.format("%d unreadable", n)
+      return
+    end
+    local e = garc_entry.decompress(codec, raw)
+    local head = {}
+    for i = 1, math.min(16, #e) do head[i] = string.format("%02X", e:byte(i)) end
+    local foot = "w=-1 h=-1 fmt=-1"
+    if #e >= 0x28 and e:sub(#e - 0x27, #e - 0x24) == "CLIM" then
+      local w, h = string.unpack("<I2I2", e, #e - 0x28 + 0x1C + 1)
+      foot = string.format("w=%d h=%d fmt=%d", w, h, e:byte(#e - 0x28 + 0x20 + 1))
+    end
+    exp.lines[#exp.lines + 1] = string.format("%d comp=%d decomp=%d head=%s footer=%s",
+      n, #raw, #e, table.concat(head, " "), foot)
+    if not exp_write(string.format("diag/icon-%d.bin", n), e) then error("write_failed", 0) end
+    exp.bins = exp.bins + 1
+    for _, rn in ipairs(M.EXPORT_RAW) do
+      if rn == n and exp.bins < M.EXPORT_MAX_BINS then
+        if not exp_write(string.format("diag/icon-%d-raw.bin", n), raw) then error("write_failed", 0) end
+        exp.bins = exp.bins + 1
+      end
+    end
+  end
+
+  local function exp_advance(team_fn)
+    if exp.state == "idle" then
+      local okg, g = pcall(codec.garc, data)
+      if not okg or type(g) ~= "table" then return exp_fail("garc_unreadable") end
+      exp.g, exp.queue, exp.state = g, exp_queue(team_fn), "run"
+      exp.header = exp_header(g.count, g)
+    end
+    local t0 = exp_clock()
+    while #exp.queue > 0 do
+      local n = table.remove(exp.queue, 1)
+      local ok, err = pcall(exp_one, n)
+      if not ok then return exp_fail(tostring(err)) end
+      local now = exp_clock()
+      if t0 and now and now - t0 >= M.EXPORT_BUDGET_MS then return end
+    end
+    local text = exp.header .. "\n" .. table.concat(exp.lines, "\n") .. "\n"
+    if not exp_write("diag/icon-index.txt", text) then return exp_fail("write_failed") end
+    exp.state = "done"
+    exp_status = string.format("done:%d files", exp.files)
+  end
+
+  -- One bounded export step (only after discovery accepted the archive); team_fn returns species
+  -- numbers of the current team or nil. Never raises.
+  function self.export_step(team_fn)
+    if exp.state == "done" or exp.state == "failed" then return end
+    if not can then exp_status = "unsupported"; exp.state = "failed"; return end
+    if state == "failed" then exp_status = "no_icon_archive"; exp.state = "failed"; return end
+    if state ~= "done" or not data then return end
+    local ok, err = pcall(exp_advance, team_fn)
+    if not ok then exp_fail(tostring(err)) end
+  end
+
+  function self.export_done() return exp.state == "done" or exp.state == "failed" end
 
   function self.found() return state == "done" end
   function self.state() return state end
@@ -582,6 +695,8 @@ function M.new(fb, personal)
     if can then state = "idle" end
     data, path, forced, dirs, cands, steps = nil, nil, {}, {}, {}, 0
     probe, probe_key, first_reject = nil, nil, nil
+    exp.state, exp.queue, exp.lines, exp.files, exp.bins, exp.g = "idle", nil, {}, 0, 0, nil
+    exp_status = "pending"
   end
 
   local function entry_for(species, form)
@@ -1449,6 +1564,14 @@ function M.attach(ctx)
     end
     if ticks >= M.ICON_START_TICK and ticks % M.ICON_STEP_EVERY == 0 and icon_store.state() ~= "done" then
       icon_store.step()
+    end
+    if icon_store.state() ~= "idle" and icon_store.state() ~= "scan" and not icon_store.export_done() then
+      icon_store.export_step(function()
+        local team = chosen and read_team()
+        local out = {}
+        for _, r in ipairs(team or {}) do out[#out + 1] = r.species end
+        return out
+      end)
     end
     local ok, err = pcall(poll)
     if not ok then warn_once("poll", "tracking failed: " .. tostring(err)) end

@@ -319,6 +319,14 @@ function M.attach(ctx)
     if ticks >= M.ICON_START_TICK and ticks % M.ICON_STEP_EVERY == 0 and icon_store.state() ~= "done" then
       icon_store.step()
     end
+    if icon_store.state() ~= "idle" and icon_store.state() ~= "scan" and not icon_store.export_done() then
+      icon_store.export_step(function()
+        local team = chosen and read_team()
+        local out = {}
+        for _, r in ipairs(team or {}) do out[#out + 1] = r.species end
+        return out
+      end)
+    end
     local ok, err = pcall(poll)
     if not ok then warn_once("poll", "tracking failed: " .. tostring(err)) end
   end
