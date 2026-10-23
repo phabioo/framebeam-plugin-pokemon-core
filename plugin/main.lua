@@ -82,7 +82,7 @@ M.GAMES = {
     codes = { "IRE" }, version = "black_2", adapter = nil },
   { id = "pokemon_white_2", name = "Pokemon White 2", gen = 5, system = "nds",
     codes = { "IRD" }, version = "white_2", adapter = nil },
-  -- Gen 3 (GBA); FrameBeam has no GBA yet
+  -- Gen 3 (GBA); no adapter yet
   { id = "pokemon_ruby", name = "Pokemon Ruby", gen = 3, system = "gba",
     codes = { "AXV" }, version = "ruby", adapter = nil },
   { id = "pokemon_sapphire", name = "Pokemon Sapphire", gen = 3, system = "gba",
